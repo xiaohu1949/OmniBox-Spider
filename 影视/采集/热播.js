@@ -4,7 +4,7 @@
 // @description 多线路：同一集在各条线路上的地址一次全列（当前线路优先）
 // @dependencies: axios, crypto-js
 // @version 1.0.4
-// @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/热播.js
+// @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/热播.js
 
 /**
  * OmniBox 爬虫脚本 - 热播（APP 接口）

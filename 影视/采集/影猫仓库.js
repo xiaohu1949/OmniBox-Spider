@@ -7,7 +7,7 @@
 // @description 多线路修复：vod_id 含下划线（search_ / up_）时不再错位，搜索入口也生效 (v1.3.3)
 // @dependencies: axios, crypto, cheerio, http, https
 // @version 1.3.3
-// @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/影猫仓库.js
+// @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/影猫仓库.js
 
 const axios = require("axios");
 const cheerio = require("cheerio");

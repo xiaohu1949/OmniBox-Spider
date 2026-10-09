@@ -3,7 +3,7 @@
 // @description 刮削：支持，弹幕：支持，嗅探：支持
 // @dependencies: axios, cheerio
 // @version 1.3.9
-// @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/七味.js
+// @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/七味.js
 
 // 注意：本源是「普通采集源」，刻意不声明 indexs / push 这两个特殊路由标记
 // （此处连 @ 符号都不写，避免客户端用宽松子串匹配时把注释误认成注解）。

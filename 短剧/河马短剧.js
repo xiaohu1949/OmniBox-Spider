@@ -3,7 +3,7 @@
 // @description
 // @dependencies: axios
 // @version 1.0.0
-// @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/短剧/河马短剧.js
+// @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/短剧/河马短剧.js
 
 /**
  * ==========================================================================
