@@ -1,8 +1,8 @@
 // @name 豆瓣推荐
 // @indexs 1
 // @author lampon
-// @description 豆瓣推荐爬虫脚本
-// @version 1.0.3
+// @description 豆瓣推荐爬虫脚本（本地增强：点开自动匹配片源 + 播放直出 + 搜索改走 rexxar）
+// @version 1.1.2
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/模板/JavaScript/豆瓣推荐.js
 
 const OmniBox = require("omnibox_sdk");
@@ -11,11 +11,18 @@ const OmniBox = require("omnibox_sdk");
 module.exports = {
   home,
   category,
+  detail,
+  search,
+  play,
 };
 
 // 使用公共 runner 处理标准输入/输出
 const runner = require("spider_runner");
-runner.run(module.exports);
+
+function buildDoubanSubjectLink(vodId) {
+  return `https://movie.douban.com/subject/${vodId}`;
+}
+
 
 /**
  * 获取首页数据
@@ -23,6 +30,7 @@ runner.run(module.exports);
  * @returns {Object} 返回分类列表和推荐视频列表
  */
 async function home(params, context) {
+  const sites = await OmniBox.getAnalyzeSites();
   try {
     // 构建分类列表
     const classes = [
@@ -48,10 +56,10 @@ async function home(params, context) {
           scene: "channel",
           new_mark_label_enabled: "1",
           vl_to_mvl: "",
-          free_watch_trans_info: '{"ad_frequency_control_time_list":{}}',
+          free_watch_trans_info: "{\"ad_frequency_control_time_list\":{}}",
           ad_exp_ids: "100000",
           ams_cookies: "lv_play_index=26; o_minduid=CpGFdExDeM8uP-XHCyma_0PzurMADpcf; appuser=83C1297D3AE9DEFF",
-          ad_trans_data: '{"game_sessions":[]}',
+          ad_trans_data: "{\"game_sessions\":[]}",
           skip_privacy_types: "0",
           support_click_scan: "1",
         },
@@ -541,11 +549,11 @@ async function home(params, context) {
       const tvListResponse = await OmniBox.request(tvListUrl, {
         method: "GET",
         headers: {
-          Accept: "*/*",
+          "Accept": "*/*",
           "Accept-Encoding": "gzip, deflate, br",
-          Connection: "keep-alive",
+          "Connection": "keep-alive",
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          referer: "https://movie.douban.com/tv/",
+          "referer": "https://movie.douban.com/tv/",
         },
       });
 
@@ -573,6 +581,7 @@ async function home(params, context) {
               vod_remarks = "新剧";
             }
 
+
             // 处理图片URL
             let vod_pic = item.pic?.large || item.pic?.normal || "";
             if (vod_pic) {
@@ -598,6 +607,7 @@ async function home(params, context) {
 
             return {
               vod_id: item.id || `douban_${item.uri}`,
+              link: buildDoubanSubjectLink(item.id || `douban_${item.uri}`),
               vod_name: item.title || "",
               vod_pic: vod_pic,
               type_id: "tv",
@@ -699,7 +709,7 @@ async function category(params, context) {
       const sort = filters.sort || "U"; // 排序，默认热度
 
       // 构建 selected_categories JSON（形式固定为"电视剧"）
-      const selectedCategories = { 形式: "电视剧" };
+      const selectedCategories = { "形式": "电视剧" };
       if (genre) selectedCategories["类型"] = genre;
       if (region) selectedCategories["地区"] = region;
       const selectedCategoriesStr = JSON.stringify(selectedCategories);
@@ -724,7 +734,7 @@ async function category(params, context) {
       const sort = filters.sort || "U"; // 排序，默认热度
 
       // 构建 selected_categories JSON（形式固定为"综艺"）
-      const selectedCategories = { 形式: "综艺" };
+      const selectedCategories = { "形式": "综艺" };
       if (genre) selectedCategories["类型"] = genre;
       if (region) selectedCategories["地区"] = region;
       const selectedCategoriesStr = JSON.stringify(selectedCategories);
@@ -748,11 +758,11 @@ async function category(params, context) {
     const response = await OmniBox.request(url, {
       method: "GET",
       headers: {
-        Accept: "*/*",
+        "Accept": "*/*",
         "Accept-Encoding": "gzip, deflate, br",
-        Connection: "keep-alive",
+        "Connection": "keep-alive",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        referer: referer,
+        "referer": referer,
       },
     });
 
@@ -815,6 +825,7 @@ async function category(params, context) {
         vod_remarks = categoryId === "movie" ? "新片" : "新剧";
       }
 
+
       // 处理图片URL，使用通用图片代理接口
       // 通过环境变量获取baseURL（脚本执行时会自动注入）
       const baseURL = context.baseURL || "";
@@ -850,6 +861,7 @@ async function category(params, context) {
 
       return {
         vod_id: item.id || `douban_${item.uri}`,
+        link: buildDoubanSubjectLink(item.id || `douban_${item.uri}`),
         vod_name: item.title || "",
         search: true,
         vod_pic: vod_pic,
@@ -880,3 +892,404 @@ async function category(params, context) {
     };
   }
 }
+
+/* ============================================================================
+ * 点开即播：详情（detail）与源内搜索（search）
+ * ----------------------------------------------------------------------------
+ * 豆瓣本身只有元数据、没有片源，所以这里做「豆瓣选片 → 自动匹配可播线路」：
+ *   1. 用豆瓣 subject id 取片名/年份/简介；
+ *   2. 拿片名去荐片（h5.jianpianips1.com）搜索；
+ *   3. 用荐片的 douban_id 字段与豆瓣 id 精确比对（该字段就是豆瓣 subject id）；
+ *   4. 命中后取其直连 m3u8 线路作为播放线路返回。
+ * 全部失败时降级为「只返回豆瓣信息」，不会报错。
+ * ============================================================================ */
+
+// 片源后端：荐片
+const JP_HOST = "https://h5.jianpianips1.com";
+const JP_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+  "Accept": "application/json, text/plain, */*",
+  "Accept-Language": "zh-CN,zh;q=0.9",
+  "Origin": JP_HOST,
+  "Referer": JP_HOST + "/",
+};
+
+// 豆瓣移动端（rexxar）接口请求头
+const DB_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+  "Accept": "*/*",
+  "Referer": "https://m.douban.com/",
+};
+
+// 与「荐片」源一致的垃圾线路过滤（VIP/FTP/常规线路不可稳定播放）
+const BLOCK_LINE_RE = /vip|ftp|常规/i;
+
+const REQ_TIMEOUT = 12000;
+
+// 播放请求头（这些 CDN 直链实测裸 UA 即可取流，Referer 按各自 origin 补齐）
+const PLAY_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+// 判断一个地址是不是媒体流直链（可 parse:0 直接交给播放器）
+const MEDIA_URL_RE = /\.(m3u8|mp4|flv|ts|mkv)(\?|#|$)/i;
+
+// 从 playId 中剥出真正的媒体地址
+function normalizePlayUrl(rawPlayId) {
+  let url = String(rawPlayId || "").trim();
+  if (!url) return "";
+  // 兼容 url|||metaB64 透传格式
+  if (url.includes("|||")) url = url.split("|||")[0];
+  // 兼容 `线路名$地址` 与 `m3u8$地址` 前缀
+  const dollar = url.lastIndexOf("$");
+  if (dollar >= 0 && dollar < url.length - 1) {
+    const tail = url.slice(dollar + 1);
+    if (/^https?:\/\//i.test(tail) || /^\/\//.test(tail)) url = tail;
+  }
+  if (url.startsWith("//")) url = "https:" + url;
+  return url.trim();
+}
+
+async function httpJson(url, headers, timeout) {
+  const response = await OmniBox.request(url, {
+    method: "GET",
+    headers: headers,
+    timeout: timeout || REQ_TIMEOUT,
+  });
+  const bodyStr =
+    typeof response.body === "string" ? response.body : String(response.body || "");
+  if (response.statusCode !== 200) {
+    throw new Error(`HTTP ${response.statusCode}`);
+  }
+  return JSON.parse(bodyStr);
+}
+
+// 归一化片名，用于比对（去掉不可见字符、标点、年份、常见后缀）
+function stripTitle(str) {
+  return String(str || "")
+    .replace(/[\u200b-\u200f\u202a-\u202e\ufeff]/g, "")
+    .toLowerCase()
+    .replace(/[\s·・:：\-—–_()（）\[\]【】!！?？,，.。'"“”‘’]/g, "")
+    .replace(/(19|20)\d{2}$/, "")
+    .replace(/(国语|粤语|英语|中字|中英|双语|高清|超清|蓝光|正片|完整版)+$/g, "");
+}
+
+// 取豆瓣单片信息（电影/剧集都试一遍）
+async function getDoubanSubject(id) {
+  const types = ["movie", "tv"];
+  for (const type of types) {
+    try {
+      const data = await httpJson(
+        `https://m.douban.com/rexxar/api/v2/${type}/${id}`,
+        DB_HEADERS
+      );
+      if (data && (data.title || data.name)) return data;
+    } catch (e) {
+      // 换下一个类型
+    }
+  }
+  return null;
+}
+
+// 荐片搜索
+async function jpSearch(keyword) {
+  const params = new URLSearchParams();
+  params.append("keyword", keyword);
+  params.append("page", 1);
+  const data = await httpJson(
+    `${JP_HOST}/api/v2/search/videoV2?key=${params.toString()}`,
+    JP_HEADERS
+  );
+  if (!data || data.code !== 1 || !Array.isArray(data.data)) return [];
+  return data.data.filter((item) => item && item.id && String(item.id) !== "0");
+}
+
+// 荐片单片详情
+async function jpDetail(videoId) {
+  const data = await httpJson(
+    `${JP_HOST}/api/video/detailv2?id=${encodeURIComponent(videoId)}`,
+    JP_HEADERS
+  );
+  if (!data || data.code !== 1 || !data.data) return null;
+  return data.data;
+}
+
+/**
+ * 用豆瓣 id + 片名在荐片里找可播片源
+ * @returns {Promise<{data: Object, matchedBy: string}|null>}
+ */
+async function matchPlayable(doubanId, title, year) {
+  const wanted = stripTitle(title);
+  if (!wanted) return null;
+
+  const candidates = await jpSearch(title);
+  if (!candidates.length) return null;
+
+  const exact = candidates.filter((item) => stripTitle(item.title) === wanted);
+  const pool = (exact.length ? exact : candidates).slice(0, 6);
+
+  const details = await Promise.all(
+    pool.map((item) => jpDetail(item.id).catch(() => null))
+  );
+
+  // 1) douban_id 完全一致（最可信）
+  const byDoubanId = details.find(
+    (d) =>
+      d &&
+      String(d.douban_id || "") === String(doubanId) &&
+      (d.source_list_source || []).length > 0
+  );
+  if (byDoubanId) return { data: byDoubanId, matchedBy: "douban_id" };
+
+  // 2) 片名一致 + 年份一致
+  const byNameYear = details.find(
+    (d) =>
+      d &&
+      (d.source_list_source || []).length > 0 &&
+      stripTitle(d.title) === wanted &&
+      (!year || !d.year || String(d.year) === String(year))
+  );
+  if (byNameYear) return { data: byNameYear, matchedBy: "title+year" };
+
+  // 3) 仅片名一致
+  const byName = details.find(
+    (d) =>
+      d && (d.source_list_source || []).length > 0 && stripTitle(d.title) === wanted
+  );
+  if (byName) return { data: byName, matchedBy: "title" };
+
+  return null;
+}
+
+// 解析播放地址：detail 里写入的 playId 已经是可直连的 m3u8，play 只做透传 + 补请求头
+async function play(params, context) {
+  const p = params || {};
+  const flag = p.flag || "play";
+  try {
+    const rawPlayId = p.playId || p.url || p.id || "";
+    const url = normalizePlayUrl(rawPlayId);
+    if (!url) {
+      await OmniBox.log("warn", "[豆瓣推荐] play 收到空地址");
+      return { url: "", flag, urls: [], parse: 1, header: {} };
+    }
+
+    const header = { "User-Agent": PLAY_UA };
+    try {
+      header.Referer = new URL(url).origin + "/";
+    } catch (e) {
+      /* 非标准 URL，忽略 */
+    }
+
+    // 网页端（影视仓 Web/模拟器）不吃自定义请求头，交给宿主自己处理
+    const isWeb = context && context.from === "web";
+    const finalHeader = isWeb ? {} : header;
+
+    // 只有「确认是媒体流」的地址才 parse:0 直出；
+    // 其余 http 地址（可能是 HTML 详情页/解析页）一律 parse:1 交给宿主嗅探，
+    // 否则客户端会把网页当视频播，报"无法播放"。
+    if (MEDIA_URL_RE.test(url)) {
+      await OmniBox.log("info", `[豆瓣推荐] 播放直出 url=${url.slice(0, 110)}`);
+      return {
+        flag,
+        urls: [{ name: p.episodeName || p.flag || "播放", url }],
+        parse: 0,
+        header: finalHeader,
+        playId: url,
+      };
+    }
+
+    // 非媒体直链：退回解析模式，交给宿主嗅探
+    await OmniBox.log("info", `[豆瓣推荐] 播放转解析 url=${url.slice(0, 110)}`);
+    return {
+      flag,
+      urls: [{ name: p.episodeName || p.flag || "播放", url }],
+      parse: 1,
+      header: finalHeader,
+    };
+  } catch (error) {
+    await OmniBox.log("error", `[豆瓣推荐] 播放失败: ${error.message}`);
+    return { url: "", flag, urls: [], parse: 1, header: {} };
+  }
+}
+
+// 荐片的 source_list_source -> OmniBox vod_play_sources（只保留 http(s) 直链）
+function buildPlaySources(sourceListSource) {
+  const playSources = [];
+  const seen = {}; // 线路内容去重：多条线路指向同一批地址时只保留第一条
+  for (const line of sourceListSource || []) {
+    const lineName = line && line.name ? String(line.name) : "线路";
+    if (BLOCK_LINE_RE.test(lineName)) continue;
+    const rawEpisodes = Array.isArray(line && line.source_list) ? line.source_list : [];
+    const episodes = [];
+    for (let i = 0; i < rawEpisodes.length; i++) {
+      const ep = rawEpisodes[i] || {};
+      const url = ep.url || "";
+      if (!url || !/^https?:\/\//i.test(url)) continue;
+      episodes.push({
+        name: ep.source_name || `第${i + 1}集`,
+        playId: url,
+        episodeName: ep.source_name || `第${i + 1}集`,
+      });
+    }
+    if (episodes.length === 0) continue;
+
+    const signature = episodes.map((e) => e.playId).join("|");
+    if (seen[signature]) continue;
+    seen[signature] = true;
+    playSources.push({ name: lineName, episodes: episodes });
+  }
+  return playSources;
+}
+
+// 豆瓣图片走宿主图片代理（豆瓣图需要 Referer）
+function proxifyPic(picUrl, baseURL) {
+  if (!picUrl) return "";
+  if (!baseURL || picUrl.indexOf(baseURL) === 0 || !/^https?:\/\//i.test(picUrl)) {
+    return picUrl;
+  }
+  return `${baseURL}/api/proxy/image?url=${encodeURIComponent(
+    `${picUrl}@Referer=https://m.douban.com`
+  )}`;
+}
+
+/**
+ * 详情（点开条目）：豆瓣元数据 + 自动匹配的可播线路
+ */
+async function detail(params, context) {
+  try {
+    const rawIds = params.videoId || params.ids || params.id || "";
+    const rawId = String(Array.isArray(rawIds) ? rawIds[0] : rawIds).split(",")[0];
+    const idHit = rawId.match(/\d{4,}/);
+    if (!idHit) return { list: [] };
+
+    const doubanId = idHit[0];
+    const baseURL = (context && context.baseURL) || "";
+
+    const subject = await getDoubanSubject(doubanId).catch(() => null);
+    const title = (subject && (subject.title || subject.name)) || "";
+    const year = (subject && subject.year) || "";
+
+    let matched = null;
+    if (title) {
+      matched = await matchPlayable(doubanId, title, year).catch(() => null);
+    }
+
+    const playSources = matched
+      ? buildPlaySources(matched.data.source_list_source)
+      : [];
+
+    await OmniBox.log(
+      "info",
+      `[豆瓣推荐] 点开 id=${doubanId} 片名=${title || "-"} 匹配=${
+        matched ? matched.matchedBy : "无"
+      } 线路=${
+        playSources.map((s) => `${s.name}(${s.episodes.length})`).join(" ") || "无"
+      }`
+    );
+
+    const dd = (matched && matched.data) || {};
+    const cast = subject && Array.isArray(subject.actors) ? subject.actors : [];
+    const directors =
+      subject && Array.isArray(subject.directors) ? subject.directors : [];
+    const rating =
+      (subject && subject.rating && subject.rating.value) ||
+      dd.score ||
+      "";
+
+    const vod = {
+      vod_id: doubanId,
+      vod_name: dd.title || title || String(doubanId),
+      vod_pic: proxifyPic(
+        (subject && subject.pic && (subject.pic.large || subject.pic.normal)) ||
+          dd.tvimg ||
+          dd.thumbnail ||
+          "",
+        baseURL
+      ),
+      vod_content: (subject && subject.intro) || dd.description || "",
+      vod_year: String(year || dd.year || ""),
+      vod_area:
+        (subject && subject.regions && subject.regions.join(" ")) ||
+        (subject && subject.countries && subject.countries.join(" ")) ||
+        "",
+      vod_actor: cast
+        .map((a) => (a && (a.name || a.latin_name)) || "")
+        .filter(Boolean)
+        .join(" "),
+      vod_director: directors
+        .map((d) => (d && d.name) || "")
+        .filter(Boolean)
+        .join(" "),
+      vod_douban_score: rating ? String(rating) : "",
+      vod_remarks: playSources.length
+        ? `已匹配 ${playSources.length} 条线路`
+        : "暂无片源",
+      type_name: "豆瓣推荐",
+    };
+    if (playSources.length > 0) vod.vod_play_sources = playSources;
+
+    return { list: [vod] };
+  } catch (error) {
+    await OmniBox.log("error", `[豆瓣推荐] 详情失败: ${error.message}`);
+    return { list: [] };
+  }
+}
+
+/**
+ * 源内搜索：豆瓣联想接口，结果点开后同样会自动匹配可播片源
+ */
+async function search(params, context) {
+  const empty = { page: 1, pagecount: 0, total: 0, list: [] };
+  try {
+    const keyword = String(params.keyword || params.wd || "").trim();
+    const page = params.page || 1;
+    if (!keyword) return empty;
+
+    const baseURL = (context && context.baseURL) || "";
+    // 🔴 v1.1.2：豆瓣 /j/subject_suggest 已失效（恒返回 200 + []，10-08 全网实测），
+    //    换移动端 rexxar 搜索 /rexxar/api/v2/search/movie?q=（免登录，同 detail 一族接口）
+    const data = await httpJson(
+      `https://m.douban.com/rexxar/api/v2/search/movie?q=${encodeURIComponent(keyword)}`,
+      DB_HEADERS
+    );
+    const raw = Array.isArray(data && data.items) ? data.items : [];
+    if (raw.length === 0) return empty;
+
+    const list = [];
+    for (const item of raw) {
+      const t = (item && item.target) || {};
+      const id = String(t.id || item.target_id || "");
+      if (!/^\d+$/.test(id)) continue;
+      list.push({
+        vod_id: id,
+        vod_name: t.title || "",
+        vod_pic: proxifyPic(t.cover_url || "", baseURL),
+        vod_year: t.year ? String(t.year) : "",
+        vod_remarks: (t.card_subtitle || "").split("/").slice(0, 2).join("/").trim() || "豆瓣",
+        type_id: "movie",
+        type_name: "豆瓣推荐",
+        search: true,
+      });
+    }
+
+    await OmniBox.log(
+      "info",
+      `[豆瓣推荐] 搜索 keyword=${keyword} 命中=${list.length}`
+    );
+
+    return {
+      page: parseInt(page, 10) || 1,
+      pagecount: list.length > 0 ? parseInt(page, 10) || 1 : 0,
+      total: list.length,
+      list: list,
+    };
+  } catch (error) {
+    await OmniBox.log("error", `[豆瓣推荐] 搜索失败: ${error.message}`);
+    return empty;
+  }
+}
+
+// 使用公共 runner 处理标准输入/输出
+runner.run(module.exports);
+
