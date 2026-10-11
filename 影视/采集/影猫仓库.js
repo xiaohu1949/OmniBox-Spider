@@ -6,7 +6,7 @@
 // @description 搜索提纯：按片名相关度过滤+重排，剔除只共享关键词片段的无关条目
 // @description 多线路修复：vod_id 含下划线（search_ / up_）时不再错位，搜索入口也生效 (v1.3.3)
 // @dependencies: axios, crypto, cheerio, http, https
-// @version 1.3.3
+// @version 1.3.4
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/影猫仓库.js
 
 const axios = require("axios");
@@ -112,15 +112,46 @@ function safeDecode(str) {
 //
 // ⚠️ 前缀必须同步升级为 v2：旧缓存里 map 的 key 是「线路号」，与修正后使用的「集序号」
 // 数值区间重叠，沿用旧前缀会把「线路 N 的全集」误当成「第 N 集的各线路」，导致点第 1 集播错集。
-const MULTI_LINE_CACHE_PREFIX = "ymck:multi:v2";
+// 【v1.3.4 修复】两处同类问题：
+//   (a) 分隔符 `_` 会与 videoId 自带的下划线冲突 —— `encodeURIComponent` **不转义下划线**，
+//       所以《庆余年_第一季》这种片名，search_xxx 里的 `_` 会让「从尾部切两段」仍然切错。
+//       换用 `§`（encodeURIComponent 会转义成 %C2%A7，且片名里几乎不出现）作分隔符。
+//   (b) 集键用的是**线路内下标 eIdx**。各线路集数/顺序并不保证一致（一条 46 集、另一条 24 集，
+//       或中间缺一集），按下标对齐会把「第 5 集的线路A 直链」和「第 5 集的线路B 直链」错配成
+//       不同集 —— 用户点第 5 集拿到的是另一条线路的第 6 集。
+//       改用 extractEpisode(ep.name) 抽出的**真实集号**做键；抽不出集号的条目退回下标并加 `i` 前缀，
+//       与真实集号区分开，避免「第 3 集」和「第 4 行」混进同一个桶。
+//
+// ⚠️ 前缀必须同步升级为 v3：v2 的 map 用「线路内下标」做键，与 v3 的「集号」数值区间重叠，
+// 沿用旧前缀会把「第 3 行」当成「第 3 集」，直接播错集。
+const MULTI_LINE_CACHE_PREFIX = "ymck:multi:v3";
 const MULTI_LINE_TTL_SECONDS = 6 * 3600;
 
-/** 从 fid(`${videoId}_${sIdx}_${eIdx}`) 解析：videoId 可能自带下划线，只能从尾部切 */
+/** fid 分隔符：§ 会被 encodeURIComponent 转义，片名里几乎不出现，比 `_` 安全 */
+const FID_SEP = "§";
+
+/** 构造多线路用的 fid：`${videoId}${SEP}${sIdx}${SEP}${epKey}` */
+function buildFid(videoId, sIdx, epKey) {
+  return `${String(videoId == null ? "" : videoId)}${FID_SEP}${sIdx}${FID_SEP}${epKey}`;
+}
+
+/**
+ * 从 episode 名里抽真实集号作为多线路对齐键；抽不出则回退「线路内下标」并加 `i` 前缀。
+ * 加前缀是为了与真实集号区分：`i3`（第 4 行，无集号）与 `3`（第 3 集）不是同一集。
+ */
+function resolveEpKey(ep, eIdx) {
+  const epNum = extractEpisode(ep?.name || "");
+  const n = parseInt(epNum, 10);
+  if (Number.isInteger(n) && n > 0) return String(n);
+  return `i${eIdx}`;
+}
+
+/** 从fid 解析：videoId 可能自带分隔符，只能从尾部切 */
 function parseFid(fid) {
-  const parts = String(fid || "").split("_");
+  const parts = String(fid || "").split(FID_SEP);
   if (parts.length < 3) return null;
   return {
-    videoId: parts.slice(0, -2).join("_"),
+    videoId: parts.slice(0, -2).join(FID_SEP),
     sIdx: parts[parts.length - 2],
     epKey: parts[parts.length - 1],
   };
@@ -466,7 +497,7 @@ async function parseKaixinSource(url) {
         episodes.push({ name: $$(a).text().trim(), playId: toAbsUrl($$(a).attr("href"), "https://www.kxyytv.com") });
       });
       if (episodes.length > 0) sources.push({ name: `开心 - ${tab.name}`, episodes });
-    } catch (e) {}
+    } catch (e) { logWarn(`[开心] 线路[${tab?.name}]解析失败: ${e.message}`); }
   });
   
   if (sources.length === 0) throw new Error("开心未匹配到任何剧集");
@@ -831,7 +862,7 @@ async function detail(params) {
           if (!exactHits) exactHits = (exactPromise ? await exactPromise : await searchExactUpstreams(vodName)) || [];
           playSources.push(...exactHitsToSources(exactHits));
           if (playSources.length > 0) logInfo(`聚合API失败，已由上游精确检索兜底 ${playSources.length} 条线路`);
-        } catch (e2) {}
+        } catch (e2) { logWarn(`聚合API与上游兜底均失败: ${e2.message}`); }
       }
     }
 
@@ -846,8 +877,12 @@ async function detail(params) {
 
     playSources.forEach((source, sIdx) => {
         source.episodes.forEach((ep, eIdx) => {
-            const fid = `${id}_${sIdx}_${eIdx}`;
-            ep._fid = fid; 
+            //【v1.3.4】集键用真实集号，不用线路内下标 —— 各线路集数不一致时按下标对齐会播错集。
+            // fid 是刮削用的 file_id，也是多线路清单的键来源，这里定错下面全错。
+            const epKey = resolveEpKey(ep, eIdx);
+            const fid = buildFid(id, sIdx, epKey);
+            ep._fid = fid;
+            ep._epKey = epKey;
             
             const epNumStr = extractEpisode(ep.name);
             let fileNameForScrape = `${vodName} ${ep.name}`; 
@@ -905,8 +940,12 @@ async function detail(params) {
                 });
 
                 const hasEpisodeNumber = source.episodes.some(ep => ep._n !== undefined);
+                // 【v1.3.4】集键已改用真实集号，排序不再影响 _fid 的语义（epKey 跟着 ep 走）。
+                // 但若该线路有条目抽不出集号（_epKey 是 `i<下标>` 形式），重排会让下标与展示行脱节，
+                // 这类线路干脆不排序，保持站点原序。
+                const hasIndexKey = source.episodes.some(ep => String(ep._epKey || "").charAt(0) === "i");
                 
-                if (hasEpisodeNumber) {
+                if (hasEpisodeNumber && !hasIndexKey) {
                     source.episodes.sort((a, b) => {
                         const seasonA = a._s || 0;
                         const seasonB = b._s || 0;
@@ -917,7 +956,7 @@ async function detail(params) {
                     });
                 }
             });
-        } catch (e) {}
+        } catch (e) { logWarn(`[详情] 刮削元数据处理失败: ${e.message}`); }
     }
 
     logInfo(`详情页加载完成, 影片: ${vodName}, 刮削耗时: ${Date.now() - tScrape}ms, 总耗时: ${Date.now() - t0}ms`);
@@ -1029,8 +1068,9 @@ async function playKaixin(url, baseResult) {
         baseResult.urls = [{ name: "直链秒播", url: targetUrl }];
         return baseResult;
       }
+      logWarn("[真狼] 未取到直链");
     }
-  } catch (e) {}
+  } catch (e) { logWarn(`[真狼] 解析失败: ${e.message}`); }
   return null;
 }
 
@@ -1089,7 +1129,7 @@ async function playZhenlang(url, baseResult) {
             }
           }
         }
-      } catch (crackErr) {}
+      } catch (crackErr) { logWarn(`[逆向] 解析失败: ${crackErr.message}`); }
 
       const sniffUrl = `https://super.playr.top/?url=${encodeURIComponent(targetUrl)}`;
       const sniffResult = await OmniBox.sniffVideo(sniffUrl);
@@ -1098,8 +1138,9 @@ async function playZhenlang(url, baseResult) {
           baseResult.header = sniffResult.header || DEFAULT_HEADERS;
           return baseResult;
       }
+      logWarn("[嗅探] 未返回有效地址");
     }
-  } catch (e) {}
+  } catch (e) { logWarn(`[嗅探] 异常: ${e.message}`); }
   return null;
 }
 
@@ -1195,19 +1236,10 @@ function searchRelevance(title, query) {
 }
 
 /**
- * 片名匹配打分：100 完全相同 / 80 前缀包含 / 60 isNameLike 通过 / 0 淘汰
- * 上游 `wd=` 是标题检索，但返回的仍可能是一串相似片（如搜「庆余年」有 13 条），
- * 所以取分数最高者；同分时取更短的名字（「庆余年」优于「庆余年之大赵逍遥王」）。
+ * 【v1.3.4】原先这里还有一个 scoreName(name, query)（100 全等 / 80 前缀 / 60 isNameLike / 0 淘汰），
+ * v1.3.2 起 search/detail/play 已全部改用 searchRelevance，它**全文无调用点**，且注释还在
+ * 误导后续维护（isNameLike 那套「前 2 字相同即相似」正是被废弃的宽松判据）。已删除。
  */
-function scoreName(name, query) {
-  const a = normName(name);
-  const b = normName(query);
-  if (!a || !b) return 0;
-  if (a === b) return 100;
-  if (a.startsWith(b) || b.startsWith(a)) return 80;
-  if (isNameLike(a, b)) return 60;
-  return 0;
-}
 
 /**
  * 搜索结果提纯（v1.3.2）
@@ -1422,7 +1454,7 @@ async function playUpstream(url, baseResult, vodName) {
           baseResult.parse = 0;
           return baseResult;
         }
-      } catch (e) {}
+      } catch (e) { logWarn(`[上游:${origin}] 采集接口解析失败: ${e.message}`); }
     }
   }
 
@@ -1443,7 +1475,8 @@ async function playUpstream(url, baseResult, vodName) {
       baseResult.parse = 0;
       return baseResult;
     }
-  } catch (e) {}
+    logWarn(`[上游:${origin}] 页面解析未取到直链`);
+  } catch (e) { logWarn(`[上游:${origin}] 页面解析失败: ${e.message}`); }
 
   logWarn(`[上游] ${origin} 未能解析出播放地址`);
   return null;
@@ -1609,7 +1642,8 @@ async function play(params) {
       logInfo(`播放解析完成 (嗅探), 耗时: ${Date.now() - t0}ms`);
       return playResult;
     }
-  } catch (e) {}
+    logWarn(`播放解析失败（嗅探未命中）: ${rawPlayId.slice(0, 80)}`);
+  } catch (e) { logWarn(`播放解析异常: ${e.message}`); }
 
   // 兜底：交由客户端嗅探。
   // 注意这是上游**详情页**地址而不是播放地址，只有支持嗅探的客户端（如 ok影视）能处理；

@@ -1,8 +1,8 @@
 // @name iKanBot
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持
-// @dependencies: axios, cheerio
-// @version 1.0.4
+// @dependencies: axios, cheerio, crypto
+// @version 1.0.5
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/iKanBot.js
 
 
@@ -15,6 +15,7 @@ const axios = require("axios");
 const cheerio = require("cheerio");
 const http = require("http");
 const https = require("https");
+const crypto = require("crypto");
 const OmniBox = require("omnibox_sdk");
 
 // ========== 全局配置 ==========
@@ -73,20 +74,55 @@ const decodeMeta = (str) => {
  * 所以：detail 阶段把「集序号 → 各线路直链」落盘，play 阶段一次全部列出。
  * 客户端每次调用都是新进程，状态必须落盘（OmniBox.setCache）。
  * ========================================================================== */
-const MULTI_LINE_CACHE_PREFIX = "ikan:multi";
+const MULTI_LINE_CACHE_PREFIX = "ikan:multi:v2";
 const MULTI_LINE_TTL_SECONDS = 6 * 3600;
 const MEDIA_URL_RE = /\.(m3u8|mp4|flv|ts|mkv|avi)(\?|#|$)/i;
 
 /** cache key 必须是安全字符：iKanBot 的 videoId 是 /play/xxxx 这种路径，含 '/' 会被当目录分隔 */
 function sanitizeCacheToken(value) {
-    return String(value || "").replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120);
+    const raw = String(value == null ? "" : value);
+    if (!raw) return "_empty";
+    // 【v1.0.5】原先只做字符替换 + 截断 120，会**碰撞**：
+    //   /play/611100 与 /play/611100?from=x 与 /play/611100#a 全部映射成同一个 key
+    //   ⇒ A 片的线路清单被当成B 片返回（缓存 6 小时，用户完全无感知），超长 id 也会撞。
+    // 改用 md5：一次性解决碰撞、截断、路径穿越三个问题。
+    // 【v1.0.5】改用顶部已加载的 crypto，避免函数内require 在离线回归里拿不到
+    try {
+        return crypto.createHash("md5").update(raw, "utf8").digest("hex");
+    } catch {
+        return raw.replace(/[^a-zA-Z0-9]/g, "_").slice(0, 120);
+    }
 }
 
 function buildMultiLineCacheKey(videoId) {
     return `${MULTI_LINE_CACHE_PREFIX}:${sanitizeCacheToken(videoId)}`;
 }
 
-/** 从 playSources 抽「集序号 → 各线路直链」；fid 形如 <videoId>#<线路号>#<集序号> */
+/**
+ * 【v1.0.5】fid 分隔符从 `#` 换成 `§`：
+ *   videoId 是 `/play/611100` 这类路径，分隔符可能出现在片名派生 id 里；
+ *   `§` 会被 encodeURIComponent 转义成 %C2%A7，片名里几乎不出现，比 `#` 安全。
+ *   解析一律「从尾部切」（videoId = 去掉末两段后重新拼回），对纯路径 id 与旧逻辑一致。
+ */
+const FID_SEP = "§";
+
+function buildFid(videoId, sIdx, epKey) {
+    return `${String(videoId == null ? "" : videoId)}${FID_SEP}${sIdx}${FID_SEP}${epKey}`;
+}
+
+/**
+ * 集键用 extractEpisode 抽出的**真实集号**，不用线路内下标 ——
+ * 快看/暴风/非凡/量子四条线路的集数与顺序并不一致，按下标对齐会播错集。
+ * 抽不出集号时回退下标并加 `i` 前缀，与真实集号区分开。
+ */
+function resolveEpKey(ep, eIdx) {
+    const epNum = extractEpisode(ep?.name || "");
+    const n = parseInt(epNum, 10);
+    if (Number.isInteger(n) && n > 0) return String(n);
+    return `i${eIdx}`;
+}
+
+/** 从 playSources 抽「集序号 → 各线路直链」；fid 形如 <videoId>§<线路号>§<集键> */
 function buildMultiLineMap(playSources) {
     const map = {};
     for (const source of playSources || []) {
@@ -96,7 +132,7 @@ function buildMultiLineMap(playSources) {
             const url = String(rawPart || "");
             if (!/^https?:\/\//i.test(url) || !MEDIA_URL_RE.test(url)) continue;
             const meta = decodeMeta(metaPart || "");
-            const fidParts = String(meta?.fid || "").split("#");
+            const fidParts = String(meta?.fid || "").split(FID_SEP);
             if (fidParts.length < 3) continue;
             const epKey = fidParts[fidParts.length - 1];
             if (!map[epKey]) map[epKey] = [];
@@ -140,10 +176,13 @@ async function loadMultiLineMap(videoId) {
 
 /** 命中清单就把该集在所有线路上的直链一次返回（当前线路排第一）；返回 null 表示走原逻辑 */
 async function resolveMultiLinePlay(rawPlayId, playMeta) {
-    const fidParts = String(playMeta?.fid || "").split("#");
+    // 【v1.0.5】从尾部切，videoId 自身可能含分隔符
+    const fidParts = String(playMeta?.fid || "").split(FID_SEP);
     if (fidParts.length < 3) return null;
-    const map = await loadMultiLineMap(fidParts[0]);
-    const list = map?.[fidParts[fidParts.length - 1]];
+    const videoId = fidParts.slice(0, -2).join(FID_SEP);
+    const epKey = fidParts[fidParts.length - 1];
+    const map = await loadMultiLineMap(videoId);
+    const list = map?.[epKey];
     if (!Array.isArray(list) || list.length <= 1) return null;
 
     const current = list.find((it) => it.u === rawPlayId);
@@ -385,8 +424,13 @@ const extractToken = ($) => {
     let keys = [];
     
     for (let i = 0; i < subId.length; i++) {
-        const curInt = parseInt(subId[i]);
+        // 【v1.0.5】原未判 NaN：current_id 末4 位一旦含非数字（站点调整 ID 规则即触发），
+        // splitPos = NaN%3+1 = NaN，substring(NaN,...) 退化成从头取 ⇒ token 全错、整个详情无播放源。
+        const curInt = parseInt(subId[i], 10);
+        if (!Number.isInteger(curInt)) return '';
         const splitPos = curInt % 3 + 1;
+        // eToken 剩余长度不足就说明 token 结构变了，直接放弃而不是切出垃圾
+        if (eToken.length < splitPos + 8) return '';
         keys[i] = eToken.substring(splitPos, splitPos + 8);
         eToken = eToken.substring(splitPos + 8, eToken.length);
     }
@@ -411,17 +455,22 @@ const parsePlaySourcesFromIkan = (playFrom, playList, vodName = '', videoId = ''
         const sourceItems = urls[i] ? urls[i].split('#') : [];
         
         const episodes = sourceItems.map((item, epIndex) => {
-            const parts = item.split('$');
-            const episodeName = parts[0] || '正片';
-            const actualPlayId = parts[1] || parts[0];
-            const fid = `${videoId}#${i}#${epIndex}`;
+            // 【v1.0.5】原先 item.split('$') 后 parts[1] 会被截断 ——
+            // MacCMS 的 url 里出现 `$`（部分 CDN 的 token/签名参数）时地址只剩半截。
+            // 改为按**第一个** `$` 切，其余全部归入 url。
+            const sepIdx = item.indexOf('$');
+            const episodeName = (sepIdx >= 0 ? item.slice(0, sepIdx) : item) || '正片';
+            const actualPlayId = sepIdx >= 0 ? item.slice(sepIdx + 1) : item;
+            if (!actualPlayId) return null;
+            // 【v1.0.5】集键用真实集号而非线路内下标，各线路集数不一致时按下标对齐会播错集
+            const fid = buildFid(videoId, i, resolveEpKey({ name: episodeName }, epIndex));
             return {
                 name: episodeName,
                 playId: `${actualPlayId}|||${encodeMeta({ sid: videoId, fid, v: vodName || '', e: episodeName })}`,
                 _fid: fid,
                 _rawName: episodeName,
             };
-        }).filter(e => e.playId);
+        }).filter(e => e && e.playId);
         
         if (episodes.length > 0) {
             playSources.push({
@@ -444,34 +493,44 @@ async function home(params, context) {
     logInfo("进入首页");
     
     try {
-        const baseURL = params?.context?.baseURL || params?.baseURL || "";
+        const baseURL = params?.context?.baseURL || params?.baseURL || context?.baseURL || "";
         // 获取分类
         const classes = [];
+
+        // 【v1.0.5】原先三次请求串行 await，最坏 45s；改为并发，总耗时≈单次
+        const [movieHtml, tvHtml, html] = await Promise.all([
+            getHtml(ikanbotConfig.host + "/hot/index-movie-热门.html"),
+            getHtml(ikanbotConfig.host + "/hot/index-tv-热门.html"),
+            getHtml(ikanbotConfig.host),
+        ]);
+
+        // 分类名优先取页面里的 h1/面包屑；<title> 没有 '-' 时 split 会拿到整串再砍头，
+        // 得到「分类电影」这种残缺名字（甚至空串）⇒ 首页分类不可用。
+        const pickCategoryName = (doc, fallback) => {
+            const $ = cheerio.load(doc);
+            const h1 = $('h1, .breadcrumb a:last, .position a:last').first().text().trim();
+            if (h1 && h1.length <= 12) return h1;
+            const t = $('title:first').text().split('-')[0].replace(/^\s*.*?(热门|电影|电视剧)\s*/, '$1').trim();
+            return t || fallback;
+        };
         
         // 电影分类
-        const movieHtml = await getHtml(ikanbotConfig.host + "/hot/index-movie-热门.html");
         if (movieHtml) {
-            const $ = cheerio.load(movieHtml);
-            const title = $('title:first').text().split('-')[0].substring(2);
             classes.push({
                 type_id: "/hot/index-movie-热门.html",
-                type_name: title
+                type_name: pickCategoryName(movieHtml, "电影")
             });
         }
         
         // 电视剧分类
-        const tvHtml = await getHtml(ikanbotConfig.host + "/hot/index-tv-热门.html");
         if (tvHtml) {
-            const $ = cheerio.load(tvHtml);
-            const title = $('title:first').text().split('-')[0].substring(2);
             classes.push({
                 type_id: "/hot/index-tv-热门.html",
-                type_name: title
+                type_name: pickCategoryName(tvHtml, "电视剧")
             });
         }
         
         // 获取首页推荐
-        const html = await getHtml(ikanbotConfig.host);
         const list = [];
         
         if (html) {
@@ -485,7 +544,9 @@ async function home(params, context) {
                 list.push({
                     vod_id: $(item).attr('href'),
                     vod_name: img.attr('alt') || $(item).find('.title').text() || '未知标题',
-                    vod_pic: fixImageUrl(imgSrc, context.baseURL),
+                    // 【v1.0.5】原先写 context.baseURL，context 为 undefined 时抛错
+                    // 被外层 catch 吞掉 ⇒ 首页整页空白。函数开头已算出 baseURL，直接用它。
+                    vod_pic: fixImageUrl(imgSrc, baseURL),
                     vod_remarks: $(item).find('.label').text() || ''
                 });
             });
@@ -808,6 +869,12 @@ async function search(params, context) {
 async function play(params) {
     let playId = params.playId;
     logInfo(`准备播放 ID: ${playId}`);
+    // 【v1.0.5】原先无入口空值防护：playId 为空时会返回 url 为 undefined 的条目，
+    // 客户端只能显示"播放失败"且无从报错。
+    if (!playId || typeof playId !== "string") {
+        logWarn("playId 为空或类型异常，直接返回空结果");
+        return { urls: [], parse: 1, header: {} };
+    }
     let vodName = "";
     let episodeName = "";
     let playMeta = {};

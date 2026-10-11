@@ -2,7 +2,7 @@
 // @author https://github.com/hjdhnx/drpy-node/blob/main/spider/js/%E4%B8%83%E5%91%B3%5B%E4%BC%98%5D.js
 // @description 刮削：支持，弹幕：支持，嗅探：支持
 // @dependencies: axios, cheerio
-// @version 1.3.9
+// @version 1.4.0
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/七味.js
 
 // 注意：本源是「普通采集源」，刻意不声明 indexs / push 这两个特殊路由标记
@@ -1037,13 +1037,24 @@ async function getMergedMetadataCached(videoId, vodName, scrapeCandidates = []) 
             logInfo("后台刷新刮削元数据", { videoId, candidateCount: scrapeCandidates.length });
             await OmniBox.processScraping(String(videoId || ""), vodName || "", vodName || "", scrapeCandidates);
             const metadata = await OmniBox.getScrapeMetadata(String(videoId || ""));
-            await setCachedJSON(metadataCacheKey, {
-                scrapeData: metadata?.scrapeData || null,
-                videoMappings: metadata?.videoMappings || [],
-                scrapeType: metadata?.scrapeType || "",
-            }, QIWEI_CACHE_EX_SECONDS);
+            const freshData = metadata?.scrapeData || null;
+            const freshMappings = metadata?.videoMappings || [];
+            // 【v1.4.0】同样只在真有内容时覆盖缓存
+            if (freshData || freshMappings.length > 0) {
+                await setCachedJSON(metadataCacheKey, {
+                    scrapeData: freshData,
+                    videoMappings: freshMappings,
+                    scrapeType: metadata?.scrapeType || "",
+                }, QIWEI_CACHE_EX_SECONDS);
+            }
         } catch (error) {
             logWarn("后台刷新刮削元数据失败", { videoId, error: error.message || String(error) });
+            // 【v1.4.0】失败时必须释放锁：锁 TTL 是 12 小时，不释放等于这段时间彻底不再刮削
+            try {
+                await OmniBox.delCache?.(metadataRefreshLockKey);
+            } catch (unlockError) {
+                logWarn("释放刮削刷新锁失败", { videoId, error: unlockError.message || String(unlockError) });
+            }
         }
     };
 
@@ -1056,11 +1067,19 @@ async function getMergedMetadataCached(videoId, vodName, scrapeCandidates = []) 
             scrapeData = metadata?.scrapeData || null;
             videoMappings = metadata?.videoMappings || [];
             scrapeType = metadata?.scrapeType || "";
-            await setCachedJSON(metadataCacheKey, {
-                scrapeData,
-                videoMappings,
-                scrapeType,
-            }, QIWEI_CACHE_EX_SECONDS);
+            // 【v1.4.0】原先无论有没有结果都写缓存 ⇒ 刮削失败时把「空元数据」缓存 12 小时，
+            // 之后每次 detail 都命中空缓存，只能靠后台刷新兜底；而后台刷新失败时锁不释放
+            // （见 refreshMetadataInBackground 的 catch），实际是 12 小时内彻底不再刮削。
+            // 现在只在真的拿到内容时才写缓存。
+            if (scrapeData || videoMappings.length > 0) {
+                await setCachedJSON(metadataCacheKey, {
+                    scrapeData,
+                    videoMappings,
+                    scrapeType,
+                }, QIWEI_CACHE_EX_SECONDS);
+            } else {
+                logWarn("刮削未返回任何结果，不写入缓存", { videoId });
+            }
             logInfo("刮削元数据读取完成", { videoId, hasScrapeData: !!scrapeData, mappingCount: videoMappings.length, scrapeType });
         } catch (error) {
             logWarn("刮削处理失败", { videoId, error: error.message || String(error) });
@@ -1308,6 +1327,11 @@ async function collectLinePlayUrls(route, lineDirectory = []) {
         }
     });
 
+    // 【v1.4.0】原先跨线路直接平铺、不去重：不同线路常返回同一个 m3u8
+    //（extractPlayUrlsFromPage 只在单页内用 seen 去重），
+    // 播放器里会出现 2~3 条同名同址的「备选」，用户以为切换其实没换。
+    // 这里按地址全局去重，只保留首次出现的线路名。
+    const seenGlobal = new Set();
     const result = [];
     for (const item of results) {
         const baseName = nameOfLine(item.line);
@@ -1316,8 +1340,10 @@ async function collectLinePlayUrls(route, lineDirectory = []) {
             continue;
         }
         urls.forEach((url, pos) => {
-            // 同一线路若吐出多个地址，追加序号区分
-            result.push({ name: urls.length > 1 ? `${baseName} ${pos + 1}` : baseName, url });
+            if (seenGlobal.has(url)) return;
+            seenGlobal.add(url);
+            // 同一线路若吐出多个地址，追加序号区分（用「源」字样避免与集号混淆）
+            result.push({ name: urls.length > 1 ? `${baseName} 源${pos + 1}` : baseName, url });
         });
     }
     logInfo("多线路播放地址解析完成", { videoId, lineIndex: lineIndex + 1, episodeIndex: episodeIndex + 1, 候选线路: candidates.map((n) => n + 1), 命中数: result.length });
@@ -2055,8 +2081,12 @@ async function play(params, context = {}) {
                             return result;
                         }
 
-                        const formattedFileId = `${shareURL}|${fileId}|${videoIdForScrape}`;
-                        const mapping = metadata.videoMappings.find((m) => m?.fileId === formattedFileId);
+                        // 【v1.4.0 修复】这里原先用 `${shareURL}|${fileId}|${videoIdForScrape}` 去匹配 mapping.fileId，
+                        // 但 detail 落盘时的 file_id 是 `${videoId}#pan#${shareCount}#${fileId}`（网盘分支），
+                        // 两者格式完全不同 ⇒ mapping 恒为 undefined ⇒ 网盘影片的刮削剧名、集号、
+                        // 弹幕全部失效，且每次白调一次 getScrapeMetadata。
+                        // 正确做法：直接用 playMeta 透传的 fid（与本文件 1348 / 2254 行一致）。
+                        const mapping = metadata.videoMappings.find((m) => m?.fileId === playMeta?.fid);
                         if (!mapping) {
                             return result;
                         }

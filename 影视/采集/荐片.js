@@ -1,7 +1,7 @@
 // @name 荐片APP
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持
-// @version 1.0.6
+// @version 1.0.7
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/荐片.js
 /**
  * ============================================================================
@@ -55,7 +55,8 @@ const PLAY_HEADERS = {
   'Origin': jpConfig.host
 };
 
-// 弹幕API配置(目前仅预留)
+// 弹幕API配置（预留占位，**当前未接入** —— 全文无调用点，
+// 也没有任何 danmaku 字段输出。头部注解里的「弹幕：支持」对本源不成立，以本注释为准）
 const DANMU_API = process.env.DANMU_API || "";
 
 /**
@@ -120,15 +121,39 @@ const decodeMeta = (str) => {
  * 所以：detail 阶段把「集序号 → 各线路直链」落盘，play 阶段一次全部列出。
  * 客户端每次调用都是新进程，状态必须落盘（OmniBox.setCache）。
  * ========================================================================== */
-const MULTI_LINE_CACHE_PREFIX = "jp:multi";
+/**
+ * 【v1.0.7】fid 分隔符从 `#` 换成 `§`：`#` 可能出现在派生的 vodId 里，
+ *   `§` 会被 encodeURIComponent 转义成 %C2%A7，片名里几乎不出现，比 `#` 安全。
+ *   解析一律「从尾部切」（vodId = 去掉末两段后重新拼回），对纯数字 id 与旧逻辑一致。
+ * ⚠️ 前缀同步升到 v2：v1 用「线路内下标」做键，与 v2 的「集号」数值区间重叠，
+ *   沿用旧前缀会把「第 3 行」当成「第 3 集」，直接播错集。
+ */
+const MULTI_LINE_CACHE_PREFIX = "jp:multi:v2";
 const MULTI_LINE_TTL_SECONDS = 6 * 3600;
 const MEDIA_URL_RE = /\.(m3u8|mp4|flv|ts|mkv|avi)(\?|#|$)/i;
+const FID_SEP = "§";
+
+function buildFid(vodId, lineName, epKey) {
+  return `${String(vodId == null ? "" : vodId)}${FID_SEP}${lineName}${FID_SEP}${epKey}`;
+}
+
+/**
+ * 【v1.0.7】集键优先用真实集号，不用线路内下标 ——
+ * 荐片各线路（VIP/极速蓝光/高清线路…）集数与顺序并不一致（VIP 30 集、蓝光 60 集很常见），
+ * 按下标对齐会把「第 3 集的线路A」和「第 3 集的线路B」错配成不同集，用户点第 3 集拿到第 4 集。
+ * 抽不出集号时回退下标并加 `i` 前缀，与真实集号区分开。
+ */
+function resolveEpKey(epName, epIdx) {
+  const n = parseInt(extractEpisode(epName || ""), 10);
+  if (Number.isInteger(n) && n > 0) return String(n);
+  return `i${epIdx}`;
+}
 
 function buildMultiLineCacheKey(videoId) {
   return `${MULTI_LINE_CACHE_PREFIX}:${String(videoId || "")}`;
 }
 
-/** 从 vod_play_sources 抽「集序号 → 各线路直链」；fid 形如 <vodId>#<线路名>#<集序号> */
+/** 从 vod_play_sources 抽「集序号 → 各线路直链」；fid 形如 <vodId>§<线路名>§<集键> */
 function buildMultiLineMap(playSources) {
   const map = {};
   for (const source of playSources || []) {
@@ -143,7 +168,7 @@ function buildMultiLineMap(playSources) {
       }
       if (!/^https?:\/\//i.test(url) || !MEDIA_URL_RE.test(url)) continue;
       const meta = decodeMeta(metaPart || "");
-      const fidParts = String(meta?.fid || "").split("#");
+      const fidParts = String(meta?.fid || "").split(FID_SEP);
       if (fidParts.length < 3) continue;
       const epKey = fidParts[fidParts.length - 1];
       if (!map[epKey]) map[epKey] = [];
@@ -187,9 +212,11 @@ async function loadMultiLineMap(videoId) {
 
 /** 命中清单就把该集在所有线路上的直链一次返回（当前线路排第一）；返回 null 表示走原逻辑 */
 async function resolveMultiLinePlay(rawPlayId, playMeta) {
-  const fidParts = String(playMeta?.fid || "").split("#");
+  const fidParts = String(playMeta?.fid || "").split(FID_SEP);
   if (fidParts.length < 3) return null;
-  const map = await loadMultiLineMap(fidParts[0]);
+  // 【v1.0.7】从尾部切，vodId 自身可能含分隔符
+  const vodId = fidParts.slice(0, -2).join(FID_SEP);
+  const map = await loadMultiLineMap(vodId);
   const list = map?.[fidParts[fidParts.length - 1]];
   if (!Array.isArray(list) || list.length <= 1) return null;
 
@@ -348,6 +375,12 @@ const getPicUrl = (path) => {
  * @returns {Array} 格式化后的列表
  */
 const formatList = (data) => {
+  //【v1.0.7】部分接口返回的是 {list:[...]} / {data:[...]} 包装而非裸数组，
+  // 原先直接判非数组就返回空 ⇒ 表现为「搜不到」。这里做一层兼容。
+  if (data && !Array.isArray(data) && typeof data === 'object') {
+    const inner = data.list || data.data || data.items;
+    if (Array.isArray(inner)) data = inner;
+  }
   if (!Array.isArray(data)) {
     logWarn('formatList 接收到的数据不是数组: ' + typeof data);
     return [];
@@ -455,23 +488,31 @@ const getHomeContent = async () => {
     const classes = [];
     const filters = {};
 
-    // 先添加普通分类
-    for (const item of res.data) {
-      if (item.id === 88 || item.id === 99) continue;
+    // 【v1.0.7】原先在循环里逐个 await 拉筛选选项（每个分类最坏 10s 超时），
+    // 5~6 个分类串行 ⇒ 首页最坏 60s，用户表现为「首页一直转圈」。
+    // 改为：先把所有分类的筛选**并发**拉回来，再顺序解析。
+    const normalCategories = res.data
+      .filter((item) => item.id !== 88 && item.id !== 99)
+      .map((item) => ({ tid: String(item.id), tName: categoryMap[String(item.id)] || item.name }));
 
-      const tid = String(item.id);
-      const tName = categoryMap[tid] || item.name;
+    for (const cat of normalCategories) {
+      classes.push({ type_id: cat.tid, type_name: cat.tName });
+    }
 
-      classes.push({ type_id: tid, type_name: tName });
-
+    // 并发预取各分类筛选（单个失败不影响其它，也不阻塞首页）
+    const filterResults = await Promise.allSettled(
+      normalCategories.map((cat) => request(`${jpConfig.host}/api/crumb/filterOptions?fcate_pid=${cat.tid}`))
+    );
+    filterResults.forEach((r, idx) => {
+      const cat = normalCategories[idx];
       // 获取该分类的筛选选项
       try {
-        OmniBox.log('info', `\n[荐片APP] ===== 获取分类[${tName}(${tid})]筛选选项 =====`);
+        OmniBox.log('info', `\n[荐片APP] ===== 获取分类[${cat.tName}(${cat.tid})]筛选选项 =====`);
 
-        const filterUrl = `${jpConfig.host}/api/crumb/filterOptions?fcate_pid=${tid}`;
-        OmniBox.log('info', `[荐片APP] 请求URL: ${filterUrl}`);
-
-        const filterRes = await request(filterUrl);
+        if (r.status !== 'fulfilled') {
+          throw new Error(r.reason?.message || '筛选请求失败');
+        }
+        const filterRes = r.value;
 
         OmniBox.log('info', `[荐片APP] 响应code: ${filterRes.code}, hasData: ${!!filterRes.data}`);
 
@@ -542,14 +583,14 @@ const getHomeContent = async () => {
           }
 
           if (fts.length > 0) {
-            filters[tid] = fts;
-            OmniBox.log('info', `[荐片APP] ✅ 分类[${tName}]筛选项已添加: ${fts.length}个`);
+            filters[cat.tid] = fts;
+            OmniBox.log('info', `[荐片APP] ✅ 分类[${cat.tName}]筛选项已添加: ${fts.length}个`);
           }
         }
       } catch (e) {
-        OmniBox.log('error', `[荐片APP] ❌ 获取分类[${tName}]筛选失败: ${e.message}`);
+        OmniBox.log('error', `[荐片APP] ❌ 获取分类[${cat.tName}]筛选失败: ${e.message}`);
       }
-    }
+    });
 
     // Netflix 分类
     classes.push({ type_id: 'netflix', type_name: 'Netflix' });
@@ -579,31 +620,41 @@ const getHomeContent = async () => {
 };
 
 /**
- * 获取首页数据
+ * 【v1.0.7】原先本文件里home() 定义了两次（这里一份、文件尾部一份），
+ * 后者覆盖前者 ⇒ 前面这 20 行是死代码。已删除，只保留尾部那一份。
  */
-async function home(params) {
-  try {
-    logInfo('处理首页请求');
-    const homeData = await getHomeContent();
-    const recommendList = await getRecommendList();
 
-    OmniBox.log('info', `[荐片APP] 首页数据: classes=${homeData.class.length}, filters=${Object.keys(homeData.filters).length}, list=${recommendList.length}`);
 
-    return {
-      class: homeData.class,
-      filters: homeData.filters,
-      list: recommendList
-    };
-  } catch (error) {
-    logError('获取首页数据失败', error);
-    return {
-      class: [],
-      filters: {},
-      list: []
-    };
+/**
+ * 【v1.0.7】取出筛选条件的实际值。
+ * `extend.type` 等字段在 home 里定义的是**选项数组**（`value: options`），
+ * 直接 `params.append('category_id', extend.type)` 会把数组 toString 成 `[object Object]`
+ * 发给接口（且同一字段被 append 两次）。这里兼容三种形态：
+ *   - 字符串/数字 → 原值
+ *   - {value}对象 → 取 .value
+ *   - 数组 → 取匹配 name 的那项.value，都不匹配则取 init/首项/空串
+ */
+const pickFilterValue = (raw) => {
+  if (raw === undefined || raw === null) return '';
+  if (typeof raw === 'string' || typeof raw === 'number') return String(raw);
+  if (Array.isArray(raw)) {
+    if (raw.length === 0) return '';
+    const first = raw[0];
+    if (first && typeof first === 'object') {
+      // 带选中标记的优先（部分客户端回传 {name, value, selected}）
+      const picked = raw.find((o) => o && (o.selected === true || o.checked === true));
+      const target = picked || first;
+      return String(target?.value ?? '');
+    }
+    return String(first);
   }
-}
-
+  if (typeof raw === 'object') {
+    if (raw.value !== undefined) return String(raw.value);
+    if (raw.id !== undefined) return String(raw.id);
+    return '';
+  }
+  return String(raw);
+};
 
 /**
  * 获取分类视频列表
@@ -619,11 +670,11 @@ const getCategoryList = async (tid, pg = 1, extend = {}) => {
     const params = new URLSearchParams();
     params.append('fcate_pid', tid);
     params.append('page', pg);
-    params.append('category_id', extend.type || '');
-    params.append('area', extend.area || '');
-    params.append('year', extend.year || '');
-    params.append('type', '');
-    params.append('sort', extend.sort || '');
+    // 【v1.0.7】原先 extend.type 被 append 了两次（type 与 category_id 各一次），且值是数组
+    params.append('category_id', pickFilterValue(extend.type));
+    params.append('area', pickFilterValue(extend.area));
+    params.append('year', pickFilterValue(extend.year));
+    params.append('sort', pickFilterValue(extend.sort));
 
     const res = await request(`${jpConfig.host}/api/crumb/list?${params.toString()}`);
 
@@ -788,14 +839,20 @@ function convertToPlaySources(sourceListSource, vodId, vodName = "") {
     if (source.source_list && source.source_list.length > 0) {
       const episodes = source.source_list.map((item, index) => {
         const episodeName = item.source_name || `第${index + 1}集`;
-        const fid = `${vodId}#${source.name || "线路"}#${index}`;
+        // 【v1.0.7】集键用真实集号，不用线路内下标 —— 各线路集数不一致时按下标对齐会播错集。
+        // 【v1.0.7】url 缺失时直接跳过：否则 encodeURIComponent("") 得到空串，
+        // 会产出一个 url 为空的死条目，客户端点了必然播放失败。
+        if (!item.url) return null;
+        const fid = buildFid(vodId, source.name || "线路", resolveEpKey(episodeName, index));
         const safeUrl = encodeURIComponent(item.url || "");
         const playId = `${safeUrl}|||${encodeMeta({ sid: vodId, fid, v: vodName || "", e: episodeName })}`;
         return {
           name: episodeName,
-          playId
+          playId,
+          _fid: fid,
+          _rawName: episodeName,
         };
-      });
+      }).filter(Boolean);
 
       playSources.push({
         name: source.name,
@@ -869,7 +926,9 @@ const getDetail = async (ids) => {
       for (const ep of source.episodes || []) {
         const metaPart = (ep.playId || "").split('|||')[1] || "";
         const meta = decodeMeta(metaPart);
-        const fid = meta?.fid || ep.playId;
+        // 【v1.0.7】meta 解析失败时**不能**退回 ep.playId —— 那是 encodeURIComponent 后的整段 URL，
+        // 会污染后续 videoMappings.find（file_id 变成超长串且永远匹配不上）。
+        const fid = meta?.fid;
         if (!fid) continue;
         scrapeCandidates.push({
           fid,
@@ -922,6 +981,8 @@ const getDetail = async (ids) => {
         }
       );
       if (hasEpisodeNumber) {
+        // 【v1.0.7】集键已改为「真实集号」并随 ep 对象走（buildFid 时就定死），
+        // 所以这里重排不会让 _fid 与展示行脱节 —— 这正是原先按下标做键时的踩坑点。
         source.episodes.sort((a, b) => {
           const metaA = decodeMeta((a.playId || "").split('|||')[1] || "");
           const metaB = decodeMeta((b.playId || "").split('|||')[1] || "");
@@ -954,7 +1015,11 @@ const getDetail = async (ids) => {
         vod_remarks: v.mask || (v.score ? `评分:${v.score}` : ''),
         vod_year: v.year || '',
         vod_area: v.area || '',
-        vod_actor: v.actors ? v.actors.map(a => a.name).join(' ') : '',
+        // 【v1.0.7】actors 可能是数组，也可能是字符串（该接口两种形态都出现过）。
+        // 字符串时 .map 抛错 ⇒ 整个 getDetail 走 catch 返回 {list:[]} ⇒ 整部片打不开。
+        vod_actor: Array.isArray(v.actors)
+          ? v.actors.map(a => (typeof a === 'string' ? a : a?.name)).filter(Boolean).join(' ')
+          : (typeof v.actors === 'string' ? v.actors : ''),
         vod_douban_score: v.score || ''
       }]
     };
@@ -1018,7 +1083,9 @@ const handlePlay = async (playId, vodId = "", context = {}) => {
     }
 
     // 构造播放响应
-    const isDirectPlayable = rawPlayId && rawPlayId.match(/\.(m3u8|mp4|flv|avi|mkv|ts)/i);
+    // 【v1.0.7】原先用无锚点的 /\.(m3u8|...)/i，形如 /play/1.mp4.html、/list?next=a.ts
+    // 的页面地址会被误判成媒体直链。改用文件顶部已定义的带锚点的 MEDIA_URL_RE。
+    const isDirectPlayable = /^https?:\/\//i.test(rawPlayId) && MEDIA_URL_RE.test(rawPlayId);
     if (isDirectPlayable) {
       // 命中 detail 落盘的多线路清单时，一次把该集在所有线路上的直链都返回（当前线路排第一）
       try {

@@ -3,7 +3,7 @@
 // @description 刮削：支持，弹幕：支持，嗅探：支持
 // @description 多线路：同一集在各条线路上的地址一次全列（当前线路优先）
 // @dependencies: axios, crypto-js
-// @version 1.0.4
+// @version 1.0.5
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/热播.js
 
 /**
@@ -59,7 +59,6 @@ const PLAY_HEADERS = {
 // 做法：detail 阶段把「集序号 → 各线路 playId」落盘，play 阶段一次全解出来。
 // 注意客户端每次调用都是新进程，状态必须落盘（OmniBox.setCache），进程内变量毫无意义。
 const MULTI_LINE_ENABLED = String(process.env.REBANG_MULTI_LINES || "true").toLowerCase() !== "false";
-const MULTI_LINE_CACHE_PREFIX = "rb:multi";
 const MULTI_LINE_TTL_SECONDS = 6 * 3600;
 const MAX_PLAY_SOURCES = (() => {
   const n = parseInt(String(process.env.MAX_PLAY_SOURCES || "0").trim(), 10);
@@ -387,23 +386,29 @@ function convertVodPlayListToSources(vodPlayList, vodName = "", videoId = "") {
     const episodes = [];
 
     (line.urls || []).forEach((item, epIndex) => {
-      const fid = `${videoId}#${index}#${epIndex}`;
+      // 【v1.0.5】集键用真实集号而非线路内下标 —— nby/lz/ff 各线路集数与顺序不一致，
+      // 按下标对齐会把「第 3 集的线路A」和「第 3 集的线路B」错配成不同集（用户点第 3 集拿到第 4 集）。
+      // 抽不出集号时回退下标并加 `i` 前缀，与真实集号区分开。
+      const epName = item.name || `第${epIndex + 1}集`;
+      const epKey = resolveEpKey(epName, epIndex);
+      const fid = buildFid(videoId, index, epKey);
       const playData = {
         url: item.url,
         p: line.parse_urls,
         r: line.referer,
         u: line.ua,
         v: vodName,
-        e: item.name || `第${episodes.length + 1}集`,
+        e: epName,
         sid: videoId,
         fid,
       };
 
       episodes.push({
-        name: item.name || `第${episodes.length + 1}集`,
+        name: epName,
         playId: e64(JSON.stringify(playData)),
         _fid: fid,
-        _rawName: item.name || `第${episodes.length + 1}集`,
+        _epKey: epKey,
+        _rawName: epName,
       });
     });
 
@@ -419,6 +424,27 @@ function convertVodPlayListToSources(vodPlayList, vodName = "", videoId = "") {
 }
 
 // ==================== 多线路解析 ====================
+/**
+ * 【v1.0.5】fid 分隔符从 `#` 换成 `§`：`#` 可能出现在派生的 videoId 里，
+ *   `§` 会被 encodeURIComponent 转义成 %C2%A7，片名里几乎不出现，比 `#` 安全。
+ *   解析一律「从尾部切」（videoId = 去掉末两段后重新拼回），对纯数字 id 与旧逻辑一致。
+ * ⚠️ 前缀同步升到 v2：v1 用「线路内下标」做键，与 v2 的「集号」数值区间重叠，
+ *   沿用旧前缀会把「第 3 行」当成「第 3 集」，直接播错集。
+ */
+const MULTI_LINE_CACHE_PREFIX = "rb:multi:v2";
+const FID_SEP = "§";
+
+function buildFid(videoId, sIdx, epKey) {
+  return `${String(videoId == null ? "" : videoId)}${FID_SEP}${sIdx}${FID_SEP}${epKey}`;
+}
+
+/** 集键优先用真实集号；抽不出才回退线路内下标并加 `i` 前缀（与真实集号区分） */
+function resolveEpKey(epName, epIdx) {
+  const n = parseInt(extractEpisode(epName || ""), 10);
+  if (Number.isInteger(n) && n > 0) return String(n);
+  return `i${epIdx}`;
+}
+
 function buildMultiLineCacheKey(videoId) {
   return `${MULTI_LINE_CACHE_PREFIX}:${String(videoId || "")}`;
 }
@@ -426,7 +452,7 @@ function buildMultiLineCacheKey(videoId) {
 /**
  * 从 detail 的 `vod_play_sources` 抽「集序号 → 各线路 playId」。
  *
- * ⚠️ 集序号必须取自 `_fid`（格式 `<videoId>#<线路号>#<集序号>`），**不能用数组下标**：
+ * ⚠️ 集序号必须取自 `_fid`（格式 `<videoId>§<线路号>§<集键>`），**不能用数组下标**：
  *    刮削之后 `episodes` 会被按季/集重新排序，下标和 fid 已经对不上（影猫那边踩过）。
  */
 function buildMultiLineMapFromSources(playSources) {
@@ -436,9 +462,9 @@ function buildMultiLineMapFromSources(playSources) {
     for (const ep of source?.episodes || []) {
       const playId = String(ep?.playId || "");
       if (!playId) continue;
-      const parts = String(ep?._fid || "").split("#");
+      const parts = String(ep?._fid || "").split(FID_SEP);
       if (parts.length < 3) continue;
-      const epKey = parts[2];
+      const epKey = parts[parts.length - 1];
       if (!map[epKey]) map[epKey] = [];
       map[epKey].push({ l: lineName, id: playId });
     }
@@ -517,11 +543,12 @@ async function resolvePlayDataToUrl(playData) {
  * 返回 `null` 表示用不上清单（未开启 / 无缓存 / 只有一条），调用方走原单线路逻辑。
  */
 async function resolveMultiLineResponse(ids, playId) {
-  const parts = String(ids?.fid || "").split("#");
+  const parts = String(ids?.fid || "").split(FID_SEP);
   if (parts.length < 3) return null;
 
-  const videoId = parts[0];
-  const epKey = parts[2];
+  // 【v1.0.5】从尾部切，videoId 自身可能含分隔符
+  const videoId = parts.slice(0, -2).join(FID_SEP);
+  const epKey = parts[parts.length - 1];
   const map = await loadMultiLineMap(videoId);
   const list = map?.[epKey];
   if (!Array.isArray(list) || list.length <= 1) return null;
@@ -687,12 +714,18 @@ async function category(params) {
     const data = await requestApi(`${HOST}/v3/home/type_search`, "POST", requestParams);
     const list = formatVideoList((data?.data?.list || []).filter((i) => i.vod_id && String(i.vod_id) !== "0"));
 
+    // 【v1.0.5】原先写死 pagecount: 9999 / total: 999999，客户端会一直翻页无限打站点
+    // （实际每页只有12 条、总共也就几页）。改成按实际返回条数推算：不满一页即到底。
+    const PAGE_SIZE = 12;
+    const hasMore = list.length >= PAGE_SIZE;
+    const apiTotal = Number(data?.data?.total ?? data?.data?.count ?? 0);
+
     return {
       list,
       page,
-      pagecount: 9999,
-      limit: 90,
-      total: 999999,
+      pagecount: hasMore ? page + 1 : page,
+      limit: PAGE_SIZE,
+      total: apiTotal > 0 ? apiTotal : list.length,
     };
   } catch (error) {
     logError("获取分类数据失败", error);
@@ -849,12 +882,17 @@ async function search(params) {
 
     const list = formatVideoList((data?.data?.list || []).filter((i) => i.vod_id && String(i.vod_id) !== "0"));
 
+    // 【v1.0.5】同category：不再返回 9999 页，按实际条数推算，不满一页即到底
+    const PAGE_SIZE = 12;
+    const hasMore = list.length >= PAGE_SIZE;
+    const apiTotal = Number(data?.data?.total ?? data?.data?.count ?? 0);
+
     return {
       list,
       page,
-      pagecount: 9999,
-      limit: list.length,
-      total: 999999,
+      pagecount: hasMore ? page + 1 : page,
+      limit: PAGE_SIZE,
+      total: apiTotal > 0 ? apiTotal : list.length,
     };
   } catch (error) {
     logError("搜索失败", error);

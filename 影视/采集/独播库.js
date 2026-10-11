@@ -2,7 +2,7 @@
 // @author @caipeibin
 // @description 刮削：支持，弹幕：支持，嗅探：支持
 // @dependencies: axios
-// @version 1.2.0
+// @version 1.2.1
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/独播库.js
 
 
@@ -439,6 +439,13 @@ async function search(params) {
 async function detail(params) {
     const vodId = params.videoId;
 
+    // 【v1.2.1】原先不判空：params.videoId 为 undefined 时 vodId.startsWith 抛错
+    // 被外层 catch 吞掉 ⇒ 返回 {list:[]}，与 iKanBot / 热播 的处理不一致。
+    if (!vodId || typeof vodId !== "string") {
+        logWarn("videoId 为空或类型异常");
+        return { list: [] };
+    }
+
     try {
         let detailPath = vodId.startsWith('/') ? vodId : '/' + vodId;
         const url = generateSignature(HOST + detailPath);
@@ -467,13 +474,22 @@ async function detail(params) {
             });
             vod_play_url = playList.join('#');
             const videoIdForScrape = String(vodId || vod_id || "");
+            // 【v1.2.1】所有 VId 都解码失败时 playList 为空，原先仍会push 一条
+            // episodes 为空的「独播库」线路 ⇒ vod_play_sources.length > 0 成立、
+            // 白跑一次 processScraping。这里只在真有集数时才建线路。
+            if (playList.length === 0) {
+                logWarn("Playlist 全部解码失败，本次不生成播放线路");
+            } else {
             vod_play_sources = [
                 {
                     name: '独播库',
                     episodes: playList.map((item, epIndex) => {
-                        const parts = item.split('$');
-                        const episodeName = parts[0] || '播放';
-                        const actualUrl = parts[1] || parts[0];
+                        // 【v1.2.1】原先 item.split('$') 后取 parts[1]，url 里出现 `$`
+                        // （部分 CDN 的 token/签名参数）时地址会被截断。改为按第一个 `$` 切。
+                        const sepIdx = item.indexOf('$');
+                        const episodeName = (sepIdx >= 0 ? item.slice(0, sepIdx) : item) || '播放';
+                        const actualUrl = sepIdx >= 0 ? item.slice(sepIdx + 1) : item;
+                        if (!actualUrl) return null;
                         const fid = `${videoIdForScrape}#0#${epIndex}`;
                         const combinedId = `${actualUrl}|||${encodeMeta({ sid: String(videoIdForScrape || ""), fid, v: data.Name || "", e: episodeName })}`;
                         return {
@@ -482,9 +498,10 @@ async function detail(params) {
                             _fid: fid,
                             _rawName: episodeName
                         };
-                    }).filter(ep => ep.playId)
+                    }).filter(ep => ep && ep.playId)
                 }
             ];
+            }
         }
 
         const detail = {
@@ -617,6 +634,12 @@ async function play(params) {
             episodeName = playMeta.e || "";
         }
         logInfo('处理播放URL', { playUrl });
+        // 【v1.2.1】原先不校验 playId：为空时 finalUrl = HOST + '/'，
+        // 每一集都会白白打一次签名请求到站点首页，失败后再触发一次无意义嗅探。
+        if (!playUrl) {
+            logWarn('playId 为空，直接返回空结果');
+            return { urls: [], parse: 1, header: {} };
+        }
         let finalUrl = playUrl;
         if (!playUrl.startsWith('http')) {
             if (playUrl.startsWith('/')) {
@@ -632,8 +655,10 @@ async function play(params) {
         const data = response.data;
         if (!data || !data.HId) {
             logInfo('未找到播放地址，回退 parse=1');
+            // 【v1.2.1】原先回退 url 用的是解密前的原始串（不是 URL），客户端拿它解析必然失败，
+            // 用户只看到空白。改成站点播放页地址，至少能被支持网页解析的客户端接手。
             return {
-                urls: [{ name: "回退", url: playUrl }],
+                urls: [{ name: "回退", url: finalUrl }],
                 parse: 1,
                 header: {
                     "User-Agent": UA,
@@ -647,7 +672,7 @@ async function play(params) {
         if (!videoUrl) {
             logInfo('视频地址解码失败，回退 parse=1');
             return {
-                urls: [{ name: "回退", url: playUrl }],
+                urls: [{ name: "回退", url: finalUrl }],
                 parse: 1,
                 header: {
                     "User-Agent": UA,
@@ -718,8 +743,10 @@ async function play(params) {
         if (fallbackSniff) {
             return fallbackSniff;
         }
+        // 【v1.2.1】同上文：回退 url 必须是可解析的地址，不是解密前的原始串
+        const fallbackUrl = playUrl && /^https?:\/\//i.test(playUrl) ? playUrl : `${HOST}/`;
         return {
-            urls: [{ name: "回退", url: playUrl }],
+            urls: [{ name: "回退", url: fallbackUrl }],
             parse: 1,
             header: {
                 "User-Agent": UA,
