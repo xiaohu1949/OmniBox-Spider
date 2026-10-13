@@ -2,7 +2,7 @@
 // @author https://github.com/hjdhnx/drpy-node/blob/main/spider/js/%E4%B8%83%E5%91%B3%5B%E4%BC%98%5D.js
 // @description 刮削：支持，弹幕：支持，嗅探：支持
 // @dependencies: axios, cheerio
-// @version 1.4.0
+// @version 1.4.1
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/七味.js
 
 // 注意：本源是「普通采集源」，刻意不声明 indexs / push 这两个特殊路由标记
@@ -15,7 +15,7 @@
 /**
  * ============================================================================
  * 七味 (QW)
- * 站点族：qwmp4 / qwmkv / qwfilm / qwfun / qwshow / qnnull / qnhot / qncool
+ * 站点族：qwmkv / qwfilm / qwfun / gmp4 / qwmp4 / qncool / qwshow（发布页 https://www.qn63.com/）
  *
  * 说明：
  * - 由旧版 drpy rule 脚本转换为 OmniBox 标准五接口格式
@@ -28,7 +28,11 @@
  * - 识别器自包含（自写 inflate/PNG 解码 + 旋转扫角 + ZNCC 模板匹配），零外部依赖
  * - 通过后 PHPSESSID 落盘复用（OmniBox.setCache），会话内后续搜索免验证
  *
- * 域名说明（v1.3.3）：域名池已按逐个实测结果更新，见下方 HOSTS 注释。
+ * 域名说明（v1.4.1）：静态池已按实测延迟重排并删掉不可用域名；
+ *  - 首选 qwmkv / qwfilm / qwfun（1.7~2.2s），删掉 qnnull(000 不可用) / qnhot(残缺页) / qmp4(回 0B)
+ *  - **新增「从发布页重新获取域名」**：https://www.qn63.com/check.js 里的 urlData 就是官方域名清单，
+ *    冷启动优先读落盘缓存，全部域名失败时自动强刷发布页（探活+按延迟排序+落盘）再试一轮
+ *  - 冷启动会沿用「上次真的供过内容的域名」，并收敛单次超时/尝试数 ⇒ 首页不再被僵死域名拖住
  *
  * 播放说明（v1.3.9）：单集默认把本站全部线路都解析出来（MAX_PLAY_SOURCES=0）。
  * - 每张播放页 /py/<vid>-<线路>-<集>.html 内联的 player_aaaa.url 就是真实 m3u8，无需嗅探
@@ -115,24 +119,223 @@ const MAX_LINE_SCAN_FALLBACK = (() => {
 })();
 
 // ==================== 全局配置 ====================
-// 域名池 2026-10-08 逐个实测更新（每个域均打过首页 + 搜索页）：
-//   可用且返回完整首页列表(203050B)：qwmp4 / qwmkv / qwfilm / qwfun / qwshow / qnnull / qncool
-//   ⚠ qnhot.com 实测 HTTPS 证书为自签（DEPTH_ZERO_SELF_SIGNED_CERT），
-//     Node/TLS 严格校验下直接拒绝；即便忽略证书也只回 302 跳走、不提供内容 ⇒ 实际不可用，
-//     保留在池尾仅为完整起见，如不想浪费一次 failover 请求可直接删除该行。
+// 域名池（2026-10-13 重新逐个实测，每个域连打 3 次首页）：
+//   第一梯队 1.7~2.2s：qwmkv(1.74/1.76/1.90)  qwfilm(1.81/1.86/2.00)  qwfun(1.92/2.06/2.19)
+//   第二梯队 1.7~8.5s：gmp4(1.71/6.17/6.21)    qwmp4(1.96/7.17/8.47)
+//   尾部兜底 6~10s  ：qncool(~6.0)             qwshow(6.89/7.85/10.01)
+//   ⚠ 顺序即优先级：**按实测延迟从快到慢排**，第一个就是最稳最快的 qwmkv。
+// 【2026-10-13 删除的三个域名（用户要求「把没用的地址删掉」）】
+//   - qnnull.com：实测 HTTP 000，6s 超时都拿不到任何响应 ⇒ 完全不可用
+//   - qnhot.com ：只返回 161701B 的**残缺首页**（正常 203283B），且要 6s+，首页列表会缺条目
+//   - qmp4.com  ：发布页标注的「永久地址（需科学上网）」，本网络实测回 0B ⇒ 留在池里纯属浪费一次 failover
+// 注：静态池只是**兜底**。运行时会优先用「从发布页重新获取」的域名（见下方 ensureHostPool），
+//     本地缓存 12h；只有发布页也拿不到时才退回这份静态清单。
 // 换域名 = 换 PHPSESSID ⇒ 切换后首次搜索要重新过一次码（会话按 origin 隔离落盘）。
 const HOSTS = [
-    "https://www.qwmp4.com",
     "https://www.qwmkv.com",
     "https://www.qwfilm.com",
     "https://www.qwfun.com",
-    "https://www.qwshow.com",
-    "https://www.qnnull.com",
-    "https://www.qnhot.com",
+    "https://www.gmp4.com",
+    "https://www.qwmp4.com",
     "https://www.qncool.com",
+    "https://www.qwshow.com",
 ];
 
 let currentHostIndex = 0;
+
+/* ============================================================================
+ * 发布页动态取址（v1.4.1 新增）
+ * ----------------------------------------------------------------------------
+ * 站点会不定期整族换域名，写死的池子迟早全死。这里补上「从发布页重新获取」能力：
+ *   发布页 https://www.qn63.com/ 是静态壳，真正的域名清单在
+ *   https://www.qn63.com/check.js 里的 `const urlData = [{url:'https://www.xxx.com'}, ...]`。
+ * 取址流程：解析 check.js → **并发**逐域名探活 → 剔除残缺/超时 → 按延迟排序 → 落盘缓存。
+ * 触发时机（不拖慢正常请求）：
+ *   ① 冷启动时优先读落盘缓存（命中就是一次本地 sqlite 读，几乎零开销）
+ *   ② **所有**静态域名都失败时才强刷发布页，并用新域名再试一轮（真正的自愈）
+ * ③ 顺带记住「上次真的供过内容的域名」，冷启动直接把它排到第一位。
+ * ========================================================================== */
+const PUBLISH_PAGE_ORIGIN = "https://www.qn63.com";
+const PUBLISH_LIST_PATH = "/check.js";
+const HOST_POOL_CACHE_KEY = "qw:hostPool:v2";
+const HOST_OK_CACHE_KEY = "qw:hostOk:v2";
+const HOST_POOL_TTL_SECONDS = (() => {
+    const n = parseInt(process.env.QW_HOST_POOL_TTL || "43200", 10); // 默认 12h
+    return Number.isFinite(n) && n >= 300 ? n : 43200;
+})();
+// 探活单次超时：首页约 203KB，6s 够快域名返回，慢域名直接判死（避免拖住首页）
+const HOST_PROBE_TIMEOUT = (() => {
+    const n = parseInt(process.env.QW_HOST_PROBE_TIMEOUT || "6000", 10);
+    return Number.isFinite(n) && n >= 1000 ? n : 6000;
+})();
+// 单次 failover 最多试几个域名（池子再长也不无限耗下去）
+const HOST_TRY_LIMIT = (() => {
+    const n = parseInt(process.env.QW_HOST_TRY_LIMIT || "4", 10);
+    return Number.isFinite(n) && n > 0 ? n : 4;
+})();
+// 单次 failover 尝试的超时：比 axios 全局的 15s 短，撞上僵死域名不至于久等。
+// 首页正常 1.7~2.2s，8s 足够判定「这个域名今天不行，换下一个」。
+const FAILOVER_TIMEOUT_MS = (() => {
+    const n = parseInt(process.env.QW_FAILOVER_TIMEOUT || "8000", 10);
+    return Number.isFinite(n) && n >= 2000 ? n : 8000;
+})();
+// 完整首页的下限字节数：低于此判为残缺页（实测完整 203283B / qnhot 残缺 161701B）
+const HOST_HOME_MIN_BYTES = 170000;
+
+/** 从 check.js 文本里抽域名：匹配 url: 'https://xxx' / url: "https://xxx" */
+function parsePublishHostList(js) {
+    const out = [];
+    const re = /url\s*:\s*['"](https?:\/\/[^'"\s]+)['"]/gi;
+    let m;
+    while ((m = re.exec(String(js || "")))) {
+        const u = m[1].replace(/\/+$/, "");
+        if (u && !out.includes(u)) out.push(u);
+    }
+    return out;
+}
+
+function applyHostPool(list, from = "") {
+    const clean = (Array.isArray(list) ? list : [])
+        .map((h) => String(h || "").replace(/\/+$/, ""))
+        .filter((h) => /^https?:\/\//i.test(h));
+    if (clean.length === 0) return false;
+    HOSTS.length = 0;
+    clean.forEach((h) => HOSTS.push(h));
+    currentHostIndex = 0;
+    logInfo("域名池已应用", {
+        from,
+        hosts: HOSTS.map((h) => h.replace(/^https?:\/\//, "")),
+    });
+    return true;
+}
+
+/** 探活：直连 axios（不经过 requestHtml，避免依赖 currentHostIndex 与 Cookie） */
+async function probeHost(host) {
+    const t0 = Date.now();
+    try {
+        const res = await axiosInstance.get(`${host}/`, {
+            headers: { ...DEFAULT_HEADERS, Referer: `${host}/` },
+            timeout: HOST_PROBE_TIMEOUT,
+            maxRedirects: 3,
+        });
+        const html = String(res.data || "");
+        const ms = Date.now() - t0;
+        if (res.status === 200 && html.length >= HOST_HOME_MIN_BYTES && html.includes("七味")) {
+            return { host, ms, ok: true, bytes: html.length };
+        }
+        return { host, ms, ok: false, why: `内容不可用(status=${res.status}, ${html.length}B)` };
+    } catch (error) {
+        return { host, ms: Date.now() - t0, ok: false, why: error.message || String(error) };
+    }
+}
+
+/** 拉发布页 → 探活 → 按延迟排序；失败返回 null（调用方回退静态池） */
+async function refreshHostPoolFromPublishPage() {
+    const listUrl = `${PUBLISH_PAGE_ORIGIN}${PUBLISH_LIST_PATH}`;
+    try {
+        logInfo("从发布页获取域名清单", { url: listUrl });
+        const res = await axiosInstance.get(listUrl, {
+            headers: { ...DEFAULT_HEADERS, Referer: `${PUBLISH_PAGE_ORIGIN}/` },
+            timeout: HOST_PROBE_TIMEOUT,
+            maxRedirects: 3,
+        });
+        const candidates = parsePublishHostList(res.data || "");
+        if (candidates.length === 0) {
+            logWarn("发布页未解析到任何域名", { bytes: String(res.data || "").length });
+            return null;
+        }
+        logInfo("发布页域名候选", { count: candidates.length, candidates });
+
+        const probes = await Promise.all(candidates.map((h) => probeHost(h)));
+        const alive = probes.filter((p) => p.ok).sort((a, b) => a.ms - b.ms);
+        logInfo("域名探活结果", {
+            alive: alive.map((p) => `${p.host.replace(/^https?:\/\//, "")}~${p.ms}ms`),
+            dead: probes.filter((p) => !p.ok).map((p) => `${p.host.replace(/^https?:\/\//, "")}(${p.why})`),
+        });
+        if (alive.length === 0) {
+            logWarn("发布页域名全部探活失败");
+            return null;
+        }
+        return alive.map((p) => p.host);
+    } catch (error) {
+        logWarn("发布页获取失败", { url: listUrl, error: error.message || String(error) });
+        return null;
+    }
+}
+
+/** 记住「真的供过内容」的域名，下次冷启动直接排第一（绝不记失败切换的目标） */
+let healthyHostRemembered = false;
+async function rememberHealthyHost(host) {
+    if (!host || healthyHostRemembered) return;
+    healthyHostRemembered = true; // 每个进程只写一次，避免每次请求都落盘
+    try {
+        // TTL 24h：万一某一刻某个域名抽风，一天后自动让它重新竞争，不会被永久打偏
+        await OmniBox.setCache(HOST_OK_CACHE_KEY, host, 24 * 3600);
+        logInfo("已记住健康域名", { host });
+    } catch {
+        // 无 runner 上下文时忽略
+    }
+}
+
+async function preferRememberedHealthyHost() {
+    try {
+        const ok = await OmniBox.getCache(HOST_OK_CACHE_KEY);
+        if (!ok || !HOSTS.includes(ok)) return;
+        const i = HOSTS.indexOf(ok);
+        if (i > 0) {
+            HOSTS.splice(i, 1);
+            HOSTS.unshift(ok);
+        }
+        currentHostIndex = 0;
+        logInfo("冷启动沿用上次供过内容的域名", { host: ok });
+    } catch {
+        // 忽略
+    }
+}
+
+let hostPoolPromise = null;
+
+/**
+ * 冷启动入口：命中落盘缓存就用缓存（一次本地读），否则**保持静态池**。
+ * 刻意不在这里强刷发布页 —— 不能让「首次访问」去等一轮探活。
+ * 真正需要换血时由 requestHtmlWithFailover 在「全部失败」后触发。
+ */
+async function ensureHostPool() {
+    if (hostPoolPromise) return hostPoolPromise;
+    hostPoolPromise = (async () => {
+        // 【手动强制重新获取】设 QW_FORCE_HOST_REFRESH=1 时忽略缓存，直接去发布页取一遍。
+        // 运维用得上：怀疑域名池过期时，跑一次带该变量的调用即可刷新落盘缓存。
+        const force = ["1", "true", "yes"].includes(
+            String(process.env.QW_FORCE_HOST_REFRESH || "").toLowerCase()
+        );
+        if (force) {
+            logInfo("QW_FORCE_HOST_REFRESH=1 ⇒ 强制从发布页重新获取域名");
+            const refreshed = await forceRefreshHostPool();
+            if (refreshed) return HOSTS;
+            logWarn("强制刷新失败，回退到缓存/静态池");
+        }
+
+        const cached = await getCachedJSON(HOST_POOL_CACHE_KEY);
+        const arr = Array.isArray(cached) ? cached : (cached && Array.isArray(cached.hosts) ? cached.hosts : null);
+        if (arr && arr.length > 0) {
+            applyHostPool(arr, "落盘缓存");
+        }
+        await preferRememberedHealthyHost();
+        return HOSTS;
+    })();
+    return hostPoolPromise;
+}
+
+/** 全部域名失败后的自救：强刷发布页一次并落盘 */
+async function forceRefreshHostPool() {
+    const fresh = await refreshHostPoolFromPublishPage();
+    if (!fresh || fresh.length === 0) return false;
+    const applied = applyHostPool(fresh, "发布页强刷");
+    if (applied) {
+        await setCachedJSON(HOST_POOL_CACHE_KEY, HOSTS.slice(0, 8), HOST_POOL_TTL_SECONDS);
+    }
+    return applied;
+}
 
 const DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -645,25 +848,23 @@ async function requestHtml(url, options = {}) {
 }
 
 /**
- * 按 host 列表自动重试。
- * - 绝对 URL：直接请求一次
- * - 相对 URL：按当前 host 开始轮询，成功即返回
+ * 单轮：从 currentHostIndex 开始，最多试 HOST_TRY_LIMIT 个域名，成功即返回。
+ * 【v1.4.1】抽成独立函数，便于「全部失败 → 换一批域名再试一轮」。
  */
-async function requestHtmlWithFailover(pathOrUrl, options = {}) {
-    if (isAbsoluteUrl(pathOrUrl)) {
-        return requestHtml(pathOrUrl, options);
-    }
-
+async function tryHostsOnce(pathOrUrl, options = {}, roundLabel = "") {
     let lastError = null;
     const startIndex = currentHostIndex;
+    const attempts = Math.max(1, Math.min(HOSTS.length, HOST_TRY_LIMIT));
 
-    for (let i = 0; i < HOSTS.length; i++) {
+    for (let i = 0; i < attempts; i++) {
         const host = HOSTS[currentHostIndex];
         const url = fixUrl(pathOrUrl, host);
         try {
-            logInfo("请求页面", { host, path: pathOrUrl });
+            logInfo("请求页面", { round: roundLabel, host, path: pathOrUrl });
             const html = await requestHtml(url, {
                 ...options,
+                // 【v1.4.1】收敛单次超时（调用方显式给的优先，如播放页的 PLAY_SOURCE_TIMEOUT）
+                timeout: options.timeout || FAILOVER_TIMEOUT_MS,
                 headers: {
                     ...(options.headers || {}),
                     Referer: `${host}/`,
@@ -679,6 +880,10 @@ async function requestHtmlWithFailover(pathOrUrl, options = {}) {
                     if (i > 0) {
                         logInfo("站点切换成功", { from: HOSTS[startIndex], to: host });
                     }
+                    logInfo("页面请求成功", { host, bytes: trimmed.length });
+                    // 【v1.4.1】记住"真的供过内容"的域名（必须 await：客户端每次调用都是新进程，
+                    // 不 await 的话落盘还没完成进程就退出了）
+                    await rememberHealthyHost(host);
                     return { html, host };
                 }
             }
@@ -691,6 +896,49 @@ async function requestHtmlWithFailover(pathOrUrl, options = {}) {
         }
 
         rotateHost();
+    }
+
+    throw lastError || new Error("all hosts failed");
+}
+
+/**
+ * 按 host 列表自动重试。
+ * - 绝对 URL：直接请求一次
+ * - 相对 URL：从当前 host 开始轮询，成功即返回
+ *
+ * 【v1.4.1 提速要点】
+ *  ① 冷启动先 ensureHostPool()：命中落盘缓存时只是一次本地读，并把「上次真的供过内容的域名」
+ *     排到第一位 ⇒ 第一发就打在最稳的域名上，不再靠运气。
+ *  ② 单轮最多试 HOST_TRY_LIMIT（默认 4）个域名，单次超时 FAILOVER_TIMEOUT_MS（默认 8s），
+ *     彻底避免「撞上僵死域名 → 15s 超时 × 整池」这种首页卡十几秒的情况。
+ *  ③ **全部失败**时才去「发布页」重新取一批域名（探活 + 按延迟排序 + 落盘）再试一轮 ⇒ 自愈。
+ */
+async function requestHtmlWithFailover(pathOrUrl, options = {}) {
+    if (isAbsoluteUrl(pathOrUrl)) {
+        return requestHtml(pathOrUrl, options);
+    }
+
+    await ensureHostPool().catch(() => {});
+
+    let lastError = null;
+    try {
+        return await tryHostsOnce(pathOrUrl, options, "首轮");
+    } catch (error) {
+        lastError = error;
+    }
+
+    // 首轮全军覆没 ⇒ 从发布页换一批新域名再来
+    logWarn("所有域名均失败，尝试从发布页重新获取域名", {
+        path: pathOrUrl,
+        lastError: lastError && (lastError.message || String(lastError)),
+    });
+    const refreshed = await forceRefreshHostPool().catch(() => false);
+    if (refreshed) {
+        try {
+            return await tryHostsOnce(pathOrUrl, options, "换源重试");
+        } catch (error) {
+            lastError = error;
+        }
     }
 
     throw lastError || new Error("all hosts failed");
