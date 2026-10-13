@@ -1,7 +1,7 @@
 // @name 荐片APP
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持
-// @version 1.0.7
+// @version 1.0.8
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/荐片.js
 /**
  * ============================================================================
@@ -34,8 +34,10 @@ const OmniBox = require("omnibox_sdk");
 const jpConfig = {
   // 主 API 域名
   host: "https://h5.jianpianips1.com",
-  // 图片域名
-  imgHost: "https://img.jgsfnl.com",
+  // 图片域名【v1.0.8 起不再使用此固定值】
+  // 站点已下线该域名，改为由 /api/v2/settings/resourceDomainConfig 动态下发，
+  // 见下方 IMG_HOST_FALLBACK / ensureImgHost()。此处仅作历史说明保留。
+  imgHost: "https://img.ypfbj.com",
   // 请求头
   headers: {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -355,6 +357,79 @@ async function request(url, options = {}) {
   }
 }
 
+/* ============================================================================
+ * 【v1.0.8】图片域名：改为**动态下发**
+ * ----------------------------------------------------------------------------
+ * 站点已下线写死的 img.jgsfnl.com（2026-10-13 实测 HTTP 000，DNS 不通），
+ * 改由接口下发一组可用域名：
+ *   GET /api/v2/settings/resourceDomainConfig → { data: { imgDomain: "a.com,b.com,c.com" } }
+ * 解析顺序：进程内 → SDK 落盘缓存(6h) → 接口 → 静态兜底。
+ * 只取下发列表的首个域名（客户端本身不支持一个封面挂多域名）。
+ * 任何一步失败都只降级不抛错，保证「域名接口挂了也还有图」。
+ * ========================================================================== */
+const IMG_HOST_CACHE_KEY = "jp:imgdomain:v1";
+const IMG_HOST_TTL_SECONDS = 6 * 3600;
+const IMG_HOST_API = "/api/v2/settings/resourceDomainConfig";
+// 静态兜底：仅在接口不可用时使用（内容取 2026-10-13 接口实际下发值）
+const IMG_HOST_FALLBACK = ["img.ypfbj.com", "img.cqkgy.com", "img.bptpw.com"];
+
+let imgHost = `https://${IMG_HOST_FALLBACK[0]}`;
+let imgHostPromise = null;
+
+/** 把各种形态的域名归一成 `https://host`；接口下发的是逗号分隔列表，只取首个 */
+const normalizeImgHost = (raw) => {
+  if (!raw || typeof raw !== 'string') return '';
+  let s = String(raw).split(',')[0].trim();
+  if (!s) return '';
+  if (!/^https?:\/\//i.test(s)) s = 'https://' + s.replace(/^\/+/, '');
+  return s.replace(/\/+$/, '');
+};
+
+/** 解析图片域名（幂等：同一进程只真正跑一次） */
+async function ensureImgHost() {
+  if (imgHostPromise) return imgHostPromise;
+  imgHostPromise = (async () => {
+    // 1) 落盘缓存（跨进程；客户端每次调用都是新进程，所以必须落盘）
+    try {
+      const cached = await OmniBox.getCache(IMG_HOST_CACHE_KEY);
+      const h = normalizeImgHost(cached);
+      if (h) {
+        imgHost = h;
+        logInfo('图片域名命中缓存', { imgHost });
+        return imgHost;
+      }
+    } catch (e) {
+      logWarn(`读取图片域名缓存失败(可忽略): ${e.message || e}`);
+    }
+
+    // 2) 接口下发
+    try {
+      const res = await request(`${jpConfig.host}${IMG_HOST_API}`);
+      const list = String(res?.data?.imgDomain || '')
+        .split(',').map((s) => s.trim()).filter(Boolean);
+      const h = normalizeImgHost(list[0]);
+      if (h) {
+        imgHost = h;
+        logInfo('图片域名取自接口', { imgHost, all: list });
+        try {
+          await OmniBox.setCache(IMG_HOST_CACHE_KEY, h, IMG_HOST_TTL_SECONDS);
+        } catch (e) {
+          logWarn(`写入图片域名缓存失败(可忽略): ${e.message || e}`);
+        }
+        return imgHost;
+      }
+      logWarn('图片域名接口未返回有效域名，改用静态兜底');
+    } catch (e) {
+      logWarn(`图片域名接口失败，改用静态兜底: ${e.message || e}`);
+    }
+
+    // 3) 静态兜底
+    imgHost = `https://${IMG_HOST_FALLBACK[0]}`;
+    return imgHost;
+  })();
+  return imgHostPromise;
+}
+
 /**
  * 获取完整图片 URL
  * @param {string} path - 图片路径
@@ -366,7 +441,8 @@ const getPicUrl = (path) => {
     return path;
   }
   const normalizedPath = path.startsWith('/') ? path : '/' + path;
-  return `${jpConfig.imgHost}${normalizedPath}`;
+  // 【v1.0.8】域名由 ensureImgHost() 动态解析（各公开入口已先 await）
+  return `${imgHost}${normalizedPath}`;
 };
 
 /**
@@ -670,8 +746,13 @@ const getCategoryList = async (tid, pg = 1, extend = {}) => {
     const params = new URLSearchParams();
     params.append('fcate_pid', tid);
     params.append('page', pg);
-    // 【v1.0.7】原先 extend.type 被 append 了两次（type 与 category_id 各一次），且值是数组
-    params.append('category_id', pickFilterValue(extend.type));
+    // 【v1.0.8】★ 修复「分类标签下什么都没有」★
+    // `type` 是服务端**强依赖**参数：缺失时 PHP 直接抛「未定义数组索引: type」并返回整页
+    // 异常 HTML ⇒ 列表恒为空。v1.0.7 误判它是重复参数而删掉，本版补回。
+    // 同时纠正维度：`type` 才是「类型」筛选（与 filterOptions 的 type 选项 id 一致：
+    // 剧情=1、爱情=2、动画=3…，实测 type=1 返回的片子 types 含「剧情」）；
+    // `category_id` 是另一个维度（服务端不传时默认 1），不是类型，故不再传。
+    params.append('type', pickFilterValue(extend.type));
     params.append('area', pickFilterValue(extend.area));
     params.append('year', pickFilterValue(extend.year));
     params.append('sort', pickFilterValue(extend.sort));
@@ -1145,6 +1226,8 @@ const handlePlay = async (playId, vodId = "", context = {}) => {
 async function home(params) {
   try {
     logInfo('处理首页请求');
+    // 【v1.0.8】先解析图片域名（失败自动降级到静态兜底，不影响首页出片）
+    await ensureImgHost();
     const homeData = await getHomeContent();
     const recommendList = await getRecommendList();
 
@@ -1182,6 +1265,9 @@ async function category(params) {
     }
 
     logInfo(`获取分类数据: categoryId=${categoryId}, page=${page}`);
+
+    // 【v1.0.8】解析图片域名（Netflix 分支与普通分类都要用封面）
+    await ensureImgHost();
 
     // 处理 Netflix 分类
     if (categoryId === 'netflix') {
@@ -1242,6 +1328,9 @@ async function detail(params) {
 
     logInfo(`获取视频详情: videoId=${videoId}`);
 
+    // 【v1.0.8】解析图片域名（详情封面）
+    await ensureImgHost();
+
     return await getDetail(videoId);
   } catch (error) {
     logError('获取视频详情失败', error);
@@ -1273,6 +1362,9 @@ async function search(params) {
     }
 
     logInfo(`搜索视频: keyword=${keyword}, page=${page}`);
+
+    // 【v1.0.8】解析图片域名（搜索结果封面）
+    await ensureImgHost();
 
     return await searchVod(keyword, page);
   } catch (error) {
