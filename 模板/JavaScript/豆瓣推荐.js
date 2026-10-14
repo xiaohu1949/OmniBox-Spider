@@ -2,7 +2,7 @@
 // @indexs 1
 // @author lampon
 // @description 豆瓣推荐爬虫脚本（本地增强：点开自动匹配片源 + 播放直出 + 搜索改走 rexxar）
-// @version 1.1.2
+// @version 1.1.3
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/模板/JavaScript/豆瓣推荐.js
 
 const OmniBox = require("omnibox_sdk");
@@ -19,6 +19,36 @@ module.exports = {
 // 使用公共 runner 处理标准输入/输出
 const runner = require("spider_runner");
 
+/* ============================================================================
+ * 短 TTL 缓存（v1.1.3 新增）
+ * 客户端每次调用都是新进程，首页/分类同一份数据会被反复打上游。
+ * 首页 + 分类页加 5 分钟缓存；空结果绝不入缓存（项目铁律）。
+ * ============================================================================ */
+const HOME_CACHE_TTL = 300; // 5 分钟
+const CAT_CACHE_TTL = 300; // 5 分钟
+
+async function readCache(key) {
+  try {
+    const raw = await OmniBox.getCache(key);
+    if (!raw) return null;
+    return typeof raw === "string" ? JSON.parse(raw) : raw;
+  } catch {
+    return null;
+  }
+}
+
+async function writeCache(key, value, ttl) {
+  try {
+    if (!value || !Array.isArray(value.list) || value.list.length === 0) return;
+    await OmniBox.setCache(key, JSON.stringify(value), ttl);
+  } catch {
+    /* 缓存失败不影响主流程 */
+  }
+}
+
+const safeCacheKey = (s) =>
+  String(s).slice(0, 40).replace(/[^\w\u4e00-\u9fa5.-]/g, "_");
+
 function buildDoubanSubjectLink(vodId) {
   return `https://movie.douban.com/subject/${vodId}`;
 }
@@ -30,8 +60,11 @@ function buildDoubanSubjectLink(vodId) {
  * @returns {Object} 返回分类列表和推荐视频列表
  */
 async function home(params, context) {
-  const sites = await OmniBox.getAnalyzeSites();
+  const cacheKey = `db:home:v1:${safeCacheKey((context && context.baseURL) || "")}`;
   try {
+    const cached = await readCache(cacheKey);
+    if (cached) return cached;
+
     // 构建分类列表
     const classes = [
       { type_id: "movie", type_name: "选电影" },
@@ -626,12 +659,14 @@ async function home(params, context) {
       await OmniBox.log("warn", `获取首页列表数据失败: ${listError.message}`);
     }
 
-    return {
+    const result = {
       class: classes,
       list: list, // 返回选剧集的综合数据
       filters: filters,
       banner: banner, // 返回Banner数据
     };
+    await writeCache(cacheKey, result, HOME_CACHE_TTL);
+    return result;
   } catch (error) {
     return {
       class: [],
@@ -659,6 +694,10 @@ async function category(params, context) {
     const categoryId = params.categoryId || "movie";
     const page = params.page || 1;
     const filters = params.filters || {};
+    const cacheKey = `db:cat:v1:${safeCacheKey(categoryId)}:${page}:${safeCacheKey(JSON.stringify(filters))}`;
+    const cached = await readCache(cacheKey);
+    if (cached) return cached;
+
     const limit = 20; // 每页数量
     const start = (page - 1) * limit;
     let url = "";
@@ -877,12 +916,14 @@ async function category(params, context) {
     // 计算总页数（movie_filter和tv_filter返回的字段名是total，其他可能不同）
     const total = data.total || data.count || list.length;
     const pagecount = Math.ceil(total / limit);
-    return {
+    const result = {
       page: page,
       pagecount: pagecount,
       total: total,
       list: list,
     };
+    await writeCache(cacheKey, result, CAT_CACHE_TTL);
+    return result;
   } catch (error) {
     return {
       page: params.page || 1,

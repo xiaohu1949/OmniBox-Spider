@@ -2,7 +2,7 @@
 // @author @caipeibin
 // @description 刮削：支持，弹幕：支持，嗅探：支持
 // @dependencies: axios
-// @version 1.2.1
+// @version 1.2.2
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/独播库.js
 
 
@@ -53,6 +53,29 @@ function logInfo(message, data = null) {
 function logError(message, error) {
     OmniBox.log("error", `[独播库] ${message}: ${error?.message || error}`);
 }
+
+// ---- 短 TTL 缓存（客户端每次调用都是新进程，首页/分类被反复打上游）----
+const HOME_CACHE_TTL = 300; // 5 分钟
+const CAT_CACHE_TTL = 300; // 5 分钟
+const readCache = async (key) => {
+    try {
+        const raw = await OmniBox.getCache(key);
+        if (!raw) return null;
+        return typeof raw === "string" ? JSON.parse(raw) : raw;
+    } catch {
+        return null;
+    }
+};
+const writeCache = async (key, value, ttl) => {
+    try {
+        // 空结果绝不入缓存（项目铁律）
+        if (!value || !Array.isArray(value.list) || value.list.length === 0) return;
+        await OmniBox.setCache(key, JSON.stringify(value), ttl);
+    } catch {
+        /* 缓存失败不影响主流程 */
+    }
+};
+const safeCacheKey = (s) => String(s).slice(0, 40).replace(/[^\w\u4e00-\u9fa5.-]/g, "_");
 
 const encodeMeta = (obj) => {
     try {
@@ -337,6 +360,9 @@ async function home(params) {
     const filters = {};
 
     try {
+        const cached = await readCache("dbk:home:v1");
+        if (cached) return cached;
+
         const url = generateSignature(`${HOST}/home`);
         logInfo("获取首页推荐", { url });
         const response = await axiosInstance.get(url, { headers: DEFAULT_HEADERS });
@@ -358,8 +384,11 @@ async function home(params) {
             });
         }
         logInfo(`获取到 ${list.length} 个首页推荐`);
+        if (list.length === 0) logWarn("首页推荐返回 0 条，接口可能变更或签名失效");
         // 首页由多个推荐板块拼成，原先只取 20 条会截掉大半内容
-        return { class: classes, filters, list: list.slice(0, 60) };
+        const result = { class: classes, filters, list: list.slice(0, 60) };
+        await writeCache("dbk:home:v1", result, HOME_CACHE_TTL);
+        return result;
     } catch (error) {
         logError("获取首页数据失败", error);
         return { class: classes, filters, list: [] };
@@ -370,7 +399,11 @@ async function category(params) {
     const categoryId = params.categoryId;
     const page = parseInt(params.page, 10) || 1;
 
+    const cacheKey = `dbk:cat:v1:${safeCacheKey(categoryId)}:${page}`;
     try {
+        const cached = await readCache(cacheKey);
+        if (cached) return cached;
+
         const pageStr = page === 1 ? '' : page.toString();
         const path = `/vodshow/${categoryId}--------${pageStr}---`;
         const url = generateSignature(HOST + path);
@@ -391,11 +424,14 @@ async function category(params) {
                 });
             });
         }
+        if (list.length === 0) logWarn(`分类 ${categoryId} 第 ${page} 页返回 0 条`);
 
         // 【修复】真实分页信息在 PaginationList 里。老代码写死 pagecount:9999 / total:999999 / limit:20，
         // 前端翻页条永远拉不到底，且 limit 与站点实际每页条数（48）不符。
         const pagecount = parsePageCount(data, page);
-        return { list, page, pagecount, limit: PAGE_ITEMS, total: pagecount * PAGE_ITEMS };
+        const result = { list, page, pagecount, limit: PAGE_ITEMS, total: pagecount * PAGE_ITEMS };
+        await writeCache(cacheKey, result, CAT_CACHE_TTL);
+        return result;
     } catch (error) {
         logError("获取分类数据失败", error);
         return { list: [], page: 1, pagecount: 0, limit: 0, total: 0 };
@@ -689,8 +725,8 @@ async function play(params) {
             header: {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
                 "Accept-Encoding": "gzip, deflate",
-                "origin": "https://w.duboku.io",
-                "referer": "https://w.duboku.io/",
+                "origin": REFERER_HOST,
+                "referer": REFERER_HOST + "/",
                 "priority": "u=1, i"
             }
         };

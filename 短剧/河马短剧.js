@@ -1,8 +1,8 @@
 // @name 河马短剧
-// @author
-// @description
+// @author xiaohu1949
+// @description 短剧：河马剧场（kuaikaw）｜刮削：不支持，弹幕：不支持，嗅探：不支持
 // @dependencies: axios, crypto-js
-// @version 1.0.2
+// @version 1.0.3
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/短剧/河马短剧.js
 
 /**
@@ -91,6 +91,41 @@ const logInfo = (message, data) => {
 const logError = (message, error) => {
     OmniBox.log("error", `[河马短剧] ${message}: ${error.message || error}`);
 };
+
+// warn 级别才会进客户端日志面板（info 会被过滤）
+const logWarn = (message, data) => {
+    if (data !== undefined && data !== null) {
+        OmniBox.log("warn", `[河马短剧] ${message}: ${JSON.stringify(data)}`);
+    } else {
+        OmniBox.log("warn", `[河马短剧] ${message}`);
+    }
+};
+
+// ========== 短 TTL 缓存（客户端每次调用都是新进程，同一份数据被反复打上游） ==========
+const HOME_CACHE_TTL = 300; // 5 分钟
+const CAT_CACHE_TTL = 300; // 5 分钟
+
+// 空结果绝不入缓存（项目铁律）
+const readCache = async (key) => {
+    try {
+        const raw = await OmniBox.getCache(key);
+        if (!raw) return null;
+        return typeof raw === "string" ? JSON.parse(raw) : raw;
+    } catch {
+        return null;
+    }
+};
+
+const writeCache = async (key, value, ttl) => {
+    try {
+        if (!value || !Array.isArray(value.list) || value.list.length === 0) return;
+        await OmniBox.setCache(key, JSON.stringify(value), ttl);
+    } catch {
+        /* 缓存失败不影响主流程 */
+    }
+};
+
+const safeCacheKey = (s) => String(s).slice(0, 40).replace(/[^\w\u4e00-\u9fa5.-]/g, "_");
 
 // ========== 工具函数 ==========
 
@@ -275,10 +310,14 @@ const normalizeSearchBook = (book) => {
 async function home(params) {
     logInfo("进入首页", params);
 
+    const cacheKey = "hmdq:home:v1";
     try {
+        const cached = await readCache(cacheKey);
+        if (cached) return cached;
+
         const classes = buildClasses();
         const homeResult = await getCategoryList(null, 1);
-        return {
+        const result = {
             class: classes,
             list: homeResult.list,
             page: 1,
@@ -286,6 +325,8 @@ async function home(params) {
             limit: homeResult.limit,
             total: homeResult.total
         };
+        await writeCache(cacheKey, result, HOME_CACHE_TTL);
+        return result;
     } catch (e) {
         logError("首页获取失败", e);
         return { class: [], list: [] };
@@ -305,7 +346,17 @@ async function category(params) {
         return { list: [], page: 1, pagecount: 1 };
     }
 
-    return await getCategoryList(categoryId, page);
+    const cacheKey = `hmdq:cat:v1:${safeCacheKey(categoryId)}:${page}`;
+    try {
+        const cached = await readCache(cacheKey);
+        if (cached) return cached;
+    } catch {
+        /* 读缓存失败，继续走网络 */
+    }
+
+    const result = await getCategoryList(categoryId, page);
+    await writeCache(cacheKey, result, CAT_CACHE_TTL);
+    return result;
 }
 
 /**
@@ -343,6 +394,7 @@ async function detail(params) {
 async function play(params) {
     const playId = params.playId;
     if (!playId) {
+        logWarn("playId 为空，返回空结果");
         return { urls: [], parse: 0 };
     }
 
@@ -370,7 +422,10 @@ const getCategoryList = async (tid, page = 1) => {
 
         const html = await requestHtml(url);
         const json = parseNextData(html);
-        if (!json) return { list: [], page: 1, pagecount: 1 };
+        if (!json) {
+            logWarn("未解析到 __NEXT_DATA__，页面结构可能已变更", { url });
+            return { list: [], page: 1, pagecount: 1 };
+        }
 
         const pageProps = json.props && json.props.pageProps ? json.props.pageProps : {};
         let videos = [];
@@ -485,7 +540,10 @@ const searchContent = async (key, page = 1) => {
         const url = `${hemaConfig.siteUrl}/search?searchValue=${encodeURIComponent(key)}&page=${page}`;
         const html = await requestHtml(url);
         const json = parseNextData(html);
-        if (!json) return { list: [], page: 1, pagecount: 1 };
+        if (!json) {
+            logWarn("未解析到 __NEXT_DATA__，页面结构可能已变更", { url });
+            return { list: [], page: 1, pagecount: 1 };
+        }
 
         const pageProps = json.props && json.props.pageProps ? json.props.pageProps : {};
         const bookList = pageProps.bookList || [];
@@ -517,13 +575,19 @@ const getDetail = async (id) => {
         const url = `${hemaConfig.siteUrl}${pathId}`;
         const html = await requestHtml(url);
         const json = parseNextData(html);
-        if (!json) return null;
+        if (!json) {
+            logWarn("详情页未解析到 __NEXT_DATA__", { url });
+            return null;
+        }
 
         const pageProps = json.props && json.props.pageProps ? json.props.pageProps : {};
         const bookInfo = pageProps.bookInfoVo || {};
         const chapterList = pageProps.chapterList || [];
 
-        if (!bookInfo.bookId) return null;
+        if (!bookInfo.bookId) {
+            logWarn("详情页缺少 bookId，无法构建剧集", { url });
+            return null;
+        }
 
         // 构建播放列表: 标题$播放地址
         const playList = [];
@@ -667,6 +731,7 @@ const getPlayUrl = async (id) => {
             }
         }
 
+        logWarn("未取到可播放地址（APP 接口与网页解析均失败）", { playId: id });
         return { parse: 0, urls: [] };
     } catch (error) {
         logError("播放解析失败", error);

@@ -5,8 +5,9 @@
 // @description 多线路：同一集在各条线路上的直链一次全列（当前线路优先）
 // @description 搜索提纯：按片名相关度过滤+重排，剔除只共享关键词片段的无关条目
 // @description 多线路修复：vod_id 含下划线（search_ / up_）时不再错位，搜索入口也生效 (v1.3.3)
+// @description 死通道短路：03yy(530)/playr.top(000) 失效通道落盘拉黑 15 分钟，省去每次 4~5s 空等 (v1.3.5)
 // @dependencies: axios, crypto, cheerio, http, https
-// @version 1.3.4
+// @version 1.3.5
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/影猫仓库.js
 
 const axios = require("axios");
@@ -76,6 +77,43 @@ const logWarn = (message, error = null) => {
 const logError = (message, error) => {
   OmniBox.log("error", `[影猫] ❌ ${message}: ${error?.message || error}`);
 };
+
+// ==================== 死通道短期拉黑（v1.3.5 新增） ====================
+// 两个上游通道实测已失效，每次调用都白等 4~5s：
+//   - www.03yy.live  → HTTP 530（源站不可用，只回 /_guard/auto.js 守卫页）
+//   - super.playr.top → HTTP 000（不可达）
+// 失败即落盘拉黑 15 分钟（客户端每次调用都是新进程，进程内变量毫无意义），
+// 到期自动解除重试 —— 站点恢复了能自己回来。
+// ⚠️ 只对「网络层失败」拉黑；解析失败（页面结构变化）不拉黑，避免误杀活着的站点。
+const DEAD_CHANNEL_TTL_SECONDS = 15 * 60;
+const deadChannelKey = (name) => `ymck:deadch:v1:${name}`;
+
+async function isChannelDead(name) {
+  try {
+    const v = await OmniBox.getCache(deadChannelKey(name));
+    return !!v;
+  } catch {
+    return false;
+  }
+}
+
+async function markChannelDead(name, reason) {
+  try {
+    await OmniBox.setCache(deadChannelKey(name), String(reason || "dead"), DEAD_CHANNEL_TTL_SECONDS);
+    logWarn(`通道 ${name} 网络层失败，短期拉黑 ${DEAD_CHANNEL_TTL_SECONDS / 60} 分钟`, reason);
+  } catch {
+    /* 拉黑失败不影响主流程 */
+  }
+}
+
+// 判断异常是否属于「网络层失败 / 源站不可用」（值得拉黑），而不是解析失败
+function isChannelNetworkFailure(err) {
+  const msg = String((err && (err.message || err.code)) || "");
+  return (
+    !!(err && err.code) || // axios: ECONNABORTED / ETIMEDOUT / ENOTFOUND / ECONNREFUSED ...
+    /timeout|timedout|socket hang up|ECONN|ENOTFOUND|EAI_AGAIN|Network Error|status code 5\d\d/i.test(msg)
+  );
+}
 
 // ==================== 辅助工具函数 ====================
 function d64(text) {
@@ -389,22 +427,31 @@ async function matchDanmu(fileName) {
 // ==================== 详情页并发解析策略 ====================
 
 async function parse03yySource(url) {
-  const res = await fetchWithCookieRedirect(url, { "Referer": "https://www.03yy.live/" }, 4000);
-  const $$ = cheerio.load(res.data);
-  const tabs = [];
-  const sources = [];
-  $$("#playlist li").each((_, el) => { tabs.push($$(el).text().replace(/[\uE000-\uF8FF]/g, '').trim()); });
+  if (await isChannelDead("03yy")) {
+    logInfo("[03影院] 通道处于拉黑期内，本次跳过详情解析");
+    return null;
+  }
+  try {
+    const res = await fetchWithCookieRedirect(url, { "Referer": "https://www.03yy.live/" }, 4000);
+    const $$ = cheerio.load(res.data);
+    const tabs = [];
+    const sources = [];
+    $$("#playlist li").each((_, el) => { tabs.push($$(el).text().replace(/[\uE000-\uF8FF]/g, '').trim()); });
 
-  $$(".play-box .play_list").each((index, el) => {
-    const episodes = [];
-    $$(el).find("ul li a").each((_, a) => {
-      episodes.push({ name: $$(a).text().trim(), playId: toAbsUrl($$(a).attr("href"), "https://www.03yy.live") });
+    $$(".play-box .play_list").each((index, el) => {
+      const episodes = [];
+      $$(el).find("ul li a").each((_, a) => {
+        episodes.push({ name: $$(a).text().trim(), playId: toAbsUrl($$(a).attr("href"), "https://www.03yy.live") });
+      });
+      if (episodes.length > 0) sources.push({ name: `03影院 - ${tabs[index] || '线路'+(index+1)}`, episodes });
     });
-    if (episodes.length > 0) sources.push({ name: `03影院 - ${tabs[index] || '线路'+(index+1)}`, episodes });
-  });
-  
-  if (sources.length === 0) throw new Error("03yy未匹配到任何剧集");
-  return { type: '03yy', sources };
+
+    if (sources.length === 0) throw new Error("03yy未匹配到任何剧集");
+    return { type: '03yy', sources };
+  } catch (e) {
+    if (isChannelNetworkFailure(e)) await markChannelDead("03yy", e);
+    throw e;
+  }
 }
 
 // 【核心修复】增强版真狼解析器，增加 URL 去重，防止集数重复
@@ -979,6 +1026,10 @@ async function detail(params) {
 // ==================== 播放页策略模式解析器 ====================
 
 async function play03yy(url, baseResult) {
+  if (await isChannelDead("03yy")) {
+    logInfo("[03影院] 通道处于拉黑期内，跳过播放解析");
+    return null;
+  }
   try {
     logInfo(`[03影院] 开始解析播放页: ${url}`);
     const res = await fetchWithCookieRedirect(url, { "Referer": "https://www.03yy.live/" }, 5000);
@@ -1047,6 +1098,7 @@ async function play03yy(url, baseResult) {
       logWarn(`[03影院] 网页源码中未找到 now 变量，可能网页结构已改变`);
     }
   } catch (e) {
+    if (isChannelNetworkFailure(e)) await markChannelDead("03yy", e);
     logWarn(`[03影院] 播放解析发生代码异常: ${e.message}`);
   }
   
@@ -1102,43 +1154,50 @@ async function playZhenlang(url, baseResult) {
         return baseResult;
       }
 
-      try {
-        const sniffUrl = `https://super.playr.top/?url=${encodeURIComponent(targetUrl)}`;
-        const playerRes = await axiosInstance.get(sniffUrl, { headers: { "Referer": "https://www.zhenlang.cc/" }, timeout: 5000 });
-        const keyMatch = playerRes.data.match(/var\s+precomputedKey\s*=\s*['"]([^'"]+)['"]/);
-        const ivMatch = playerRes.data.match(/var\s+precomputedIv\s*=\s*['"]([^'"]+)['"]/);
-        
-        if (keyMatch && ivMatch) {
-          const dynamicKey = keyMatch[1];
-          const dynamicIv = ivMatch[1];
-          const tokenRes = await axiosInstance.get(`https://super.playr.top/token.php?url=${encodeURIComponent(targetUrl)}`, { headers: { "Referer": "https://www.zhenlang.cc/" }, timeout: 5000 });
-          if (tokenRes.data && tokenRes.data.code === 0) {
-            const apiRes = await axiosInstance.get(`https://super.playr.top/api.php?url=${encodeURIComponent(targetUrl)}&token=${tokenRes.data.token}&t=${tokenRes.data.t}`, { headers: { "Referer": "https://www.zhenlang.cc/" }, timeout: 5000 });
-            if (apiRes.data && apiRes.data.e === 1 && apiRes.data.d) {
-              const decipher = crypto.createDecipheriv("aes-128-cbc", Buffer.from(dynamicKey), Buffer.from(dynamicIv));
-              let decrypted = decipher.update(apiRes.data.d, "base64", "utf8");
-              decrypted += decipher.final("utf8");
-              const parsedData = JSON.parse(decrypted);
-              if (parsedData.url) {
-                baseResult.urls = [{ name: "逆向秒播", url: parsedData.url }];
+      if (await isChannelDead("playr")) {
+        logInfo("[嗅探] super.playr.top 处于拉黑期内，跳过嗅探通道");
+      } else {
+        try {
+          const sniffUrl = `https://super.playr.top/?url=${encodeURIComponent(targetUrl)}`;
+          const playerRes = await axiosInstance.get(sniffUrl, { headers: { "Referer": "https://www.zhenlang.cc/" }, timeout: 5000 });
+          const keyMatch = playerRes.data.match(/var\s+precomputedKey\s*=\s*['"]([^'"]+)['"]/);
+          const ivMatch = playerRes.data.match(/var\s+precomputedIv\s*=\s*['"]([^'"]+)['"]/);
+
+          if (keyMatch && ivMatch) {
+            const dynamicKey = keyMatch[1];
+            const dynamicIv = ivMatch[1];
+            const tokenRes = await axiosInstance.get(`https://super.playr.top/token.php?url=${encodeURIComponent(targetUrl)}`, { headers: { "Referer": "https://www.zhenlang.cc/" }, timeout: 5000 });
+            if (tokenRes.data && tokenRes.data.code === 0) {
+              const apiRes = await axiosInstance.get(`https://super.playr.top/api.php?url=${encodeURIComponent(targetUrl)}&token=${tokenRes.data.token}&t=${tokenRes.data.t}`, { headers: { "Referer": "https://www.zhenlang.cc/" }, timeout: 5000 });
+              if (apiRes.data && apiRes.data.e === 1 && apiRes.data.d) {
+                const decipher = crypto.createDecipheriv("aes-128-cbc", Buffer.from(dynamicKey), Buffer.from(dynamicIv));
+                let decrypted = decipher.update(apiRes.data.d, "base64", "utf8");
+                decrypted += decipher.final("utf8");
+                const parsedData = JSON.parse(decrypted);
+                if (parsedData.url) {
+                  baseResult.urls = [{ name: "逆向秒播", url: parsedData.url }];
+                  return baseResult;
+                }
+              } else if (apiRes.data && apiRes.data.url) {
+                baseResult.urls = [{ name: "逆向秒播", url: apiRes.data.url }];
                 return baseResult;
               }
-            } else if (apiRes.data && apiRes.data.url) {
-              baseResult.urls = [{ name: "逆向秒播", url: apiRes.data.url }];
-              return baseResult;
             }
           }
+        } catch (crackErr) {
+          if (isChannelNetworkFailure(crackErr)) await markChannelDead("playr", crackErr);
+          logWarn(`[逆向] 解析失败: ${crackErr.message}`);
         }
-      } catch (crackErr) { logWarn(`[逆向] 解析失败: ${crackErr.message}`); }
 
-      const sniffUrl = `https://super.playr.top/?url=${encodeURIComponent(targetUrl)}`;
-      const sniffResult = await OmniBox.sniffVideo(sniffUrl);
-      if (sniffResult && sniffResult.url) {
-          baseResult.urls = [{ name: "嗅探线路", url: sniffResult.url }];
-          baseResult.header = sniffResult.header || DEFAULT_HEADERS;
-          return baseResult;
+        const sniffUrl = `https://super.playr.top/?url=${encodeURIComponent(targetUrl)}`;
+        const sniffResult = await OmniBox.sniffVideo(sniffUrl);
+        if (sniffResult && sniffResult.url) {
+            baseResult.urls = [{ name: "嗅探线路", url: sniffResult.url }];
+            baseResult.header = sniffResult.header || DEFAULT_HEADERS;
+            return baseResult;
+        }
+        logWarn("[嗅探] 未返回有效地址");
       }
-      logWarn("[嗅探] 未返回有效地址");
     }
   } catch (e) { logWarn(`[嗅探] 异常: ${e.message}`); }
   return null;

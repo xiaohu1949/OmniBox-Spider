@@ -1,8 +1,8 @@
 // @name 哔哩大全
-// @author 
-// @description 弹幕：支持
+// @author xiaohu1949
+// @description 刮削：不支持，弹幕：支持，嗅探：不支持，登录：支持
 // @dependencies: axios, crypto
-// @version 1.2.1
+// @version 1.2.2
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/综合/哔哩大全.js
 
 /**
@@ -13,6 +13,15 @@ const crypto = require("crypto");
 const OmniBox = require("omnibox_sdk");
 
 // ==================== 配置区域 ====================
+// 【v1.2.2】统一 HTTP 实例：B 站接口一旦黑洞式挂起，axios 默认「不超时」会一直阻塞到客户端
+// 自己的预算杀进程——表现为「卡住不返回」，而不是「快速失败换源」。
+// 实测 B 站接口 0.7~1.1s 返回，12s 上限非常安全。
+const httpClient = axios.create({ timeout: 12000 });
+
+// 首页/分类短 TTL 缓存（客户端每次调用都是新进程，同一份数据被反复打上游）
+const HOME_CACHE_TTL = 300; // 5 分钟
+const CAT_CACHE_TTL = 300; // 5 分钟
+
 const BILI_COOKIE = process.env.BILI_COOKIE || "";
 const DANMU_API = process.env.DANMU_API || "";
 
@@ -77,7 +86,7 @@ async function getWbiKeys() {
   if (_wbiKeysCache) return _wbiKeysCache;
   try {
     const navHeaders = await initSearchHeaders();
-    const { data } = await axios.get("https://api.bilibili.com/x/web-interface/nav", {
+    const { data } = await httpClient.get("https://api.bilibili.com/x/web-interface/nav", {
       headers: navHeaders,
     });
     logInfo(`nav接口 code: ${data?.code}, message: ${data?.message}`);
@@ -93,6 +102,7 @@ async function getWbiKeys() {
     return _wbiKeysCache;
   } catch (err) {
     logError("获取WbiKeys失败", err);
+    logWarn("WbiKeys 获取失败，搜索签名将使用空 key（结果可能为空）");
     return { imgKey: "", subKey: "" };
   }
 }
@@ -294,6 +304,32 @@ function logError(msg, err) {
   OmniBox.log("error", `[BILI-ALL] ${msg}: ${err?.message || err}`);
 }
 
+// warn 级别才会进客户端日志面板（info 会被过滤）
+function logWarn(msg) {
+  OmniBox.log("warn", `[BILI-ALL] ${msg}`);
+}
+
+// ---- 缓存工具：空结果绝不入缓存（项目铁律）----
+async function readCache(key) {
+  try {
+    const raw = await OmniBox.getCache(key);
+    if (!raw) return null;
+    return typeof raw === "string" ? JSON.parse(raw) : raw;
+  } catch {
+    return null;
+  }
+}
+async function writeCache(key, value, ttlSeconds) {
+  try {
+    if (!value || !Array.isArray(value.list) || value.list.length === 0) return;
+    await OmniBox.setCache(key, JSON.stringify(value), ttlSeconds);
+  } catch {
+    /* 缓存失败不影响主流程 */
+  }
+}
+const safeCacheKey = (s) =>
+  String(s).slice(0, 40).replace(/[^\w\u4e00-\u9fa5.-]/g, "_");
+
 function fixCover(url) {
   if (!url) return "";
   if (url.startsWith("//")) return `https:${url}`;
@@ -437,9 +473,13 @@ async function matchDanmu(fileName, cid) {
 }
 
 async function home(params) {
+  const cacheKey = "bili_all:home:v1";
   try {
+    const cached = await readCache(cacheKey);
+    if (cached) return cached;
+
     const url = "https://api.bilibili.com/x/web-interface/popular?ps=20&pn=1";
-    const { data } = await axios.get(url, { headers: BILI_HEADERS });
+    const { data } = await httpClient.get(url, { headers: BILI_HEADERS });
 
     const list = (data?.data?.list || []).map((item) => ({
       vod_id: String(item.aid || ""),
@@ -447,11 +487,11 @@ async function home(params) {
       vod_pic: fixCover(item.pic),
       vod_remarks: formatDuration(item.duration),
     }));
+    if (list.length === 0) logWarn("首页热门接口返回 0 条，可能被限流或接口变更");
 
-    return {
-      class: CLASSES,
-      list,
-    };
+    const result = { class: CLASSES, list };
+    await writeCache(cacheKey, result, HOME_CACHE_TTL);
+    return result;
   } catch (error) {
     logError("首页获取失败", error);
     return { class: CLASSES, list: [] };
@@ -466,6 +506,9 @@ async function category(params) {
   }
 
   try {
+    const cached = await readCache(`bili_all:cat:v1:${safeCacheKey(keyword)}:${page}`);
+    if (cached) return cached;
+
     const rawParams = {
       search_type: "video",
       keyword,
@@ -475,14 +518,14 @@ async function category(params) {
     logInfo(`签名参数: ${JSON.stringify(signedParams)}`);
     const searchHeaders = await initSearchHeaders();
     logInfo(`搜索Cookie(含buvid): ${searchHeaders.Cookie?.substring(0, 120)}`);
-    const { data } = await axios.get("https://api.bilibili.com/x/web-interface/search/type", {
+    const { data } = await httpClient.get("https://api.bilibili.com/x/web-interface/search/type", {
       headers: searchHeaders,
       params: signedParams,
     });
     logInfo(`搜索响应 code: ${data?.code}, message: ${data?.message}`);
     logInfo(`搜索结果数量: ${(data?.data?.result || []).length}, numResults: ${data?.data?.numResults}`);
     if (data?.code !== 0) {
-      logInfo(`搜索响应完整: ${JSON.stringify(data).substring(0, 500)}`);
+      logWarn(`搜索接口返回非 0（code=${data?.code}, message=${data?.message}），体: ${JSON.stringify(data).substring(0, 300)}`);
     }
 
     const list = (data?.data?.result || [])
@@ -493,13 +536,16 @@ async function category(params) {
         vod_pic: fixCover(item.pic),
         vod_remarks: formatSearchDuration(item.duration),
       }));
+    if (list.length === 0) logWarn(`分类搜索「${keyword}」第 ${page} 页返回 0 条`);
 
-    return {
+    const result = {
       page,
       pagecount: data?.data?.numPages || 1,
       total: data?.data?.numResults || list.length,
       list,
     };
+    await writeCache(`bili_all:cat:v1:${safeCacheKey(keyword)}:${page}`, result, CAT_CACHE_TTL);
+    return result;
   } catch (error) {
     logError("分类获取失败", error);
     return { page, pagecount: 0, total: 0, list: [] };
@@ -518,12 +564,15 @@ async function detail(params) {
   if (!videoId) return { list: [] };
 
   try {
-    const { data } = await axios.get(`https://api.bilibili.com/x/web-interface/view?aid=${videoId}`, {
+    const { data } = await httpClient.get(`https://api.bilibili.com/x/web-interface/view?aid=${videoId}`, {
       headers: BILI_HEADERS,
     });
 
     const video = data?.data;
-    if (!video) return { list: [] };
+    if (!video) {
+      logWarn(`详情接口未返回数据 videoId=${videoId}（可能已下架或需登录）`);
+      return { list: [] };
+    }
 
     const episodes = (video.pages || []).map((p, i) => {
       const part = p.part || `第${i + 1}集`;
@@ -615,7 +664,7 @@ async function play(params, context = {}) {
   for (const qn of qualityList) {
     const useDash = qn > 116;
     try {
-      const { data } = await axios.get("https://api.bilibili.com/x/player/playurl", {
+      const { data } = await httpClient.get("https://api.bilibili.com/x/player/playurl", {
         headers,
         params: {
           avid,
@@ -670,12 +719,13 @@ async function play(params, context = {}) {
           audioUrl: "",
         });
       }
-    } catch {
-      // 忽略单个画质异常，继续尝试其他画质
+    } catch (e) {
+      logWarn(`画质 qn=${qn} 请求失败: ${e?.message || e}`);
     }
   }
 
   if (availableQualities.length === 0) {
+    logWarn(`所有画质均未取到播放地址 avid=${avid} cid=${cid}（登录态=${loggedIn ? "是" : "否"}），退回 playId`);
     return {
       urls: [{ name: "播放", url: playId }],
       parse: 1,
@@ -731,7 +781,7 @@ async function proxy(params = {}) {
   };
 
   try {
-    const { data } = await axios.get("https://api.bilibili.com/x/player/playurl", {
+    const { data } = await httpClient.get("https://api.bilibili.com/x/player/playurl", {
       headers,
       params: {
         avid,

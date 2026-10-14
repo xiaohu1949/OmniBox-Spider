@@ -2,7 +2,7 @@
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持
 // @dependencies: axios, cheerio, crypto
-// @version 1.0.5
+// @version 1.0.6
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/iKanBot.js
 
 
@@ -45,6 +45,12 @@ const logInfo = (message, data = null) => {
 
 const logError = (message, error) => {
     OmniBox.log("error", `[iKanBot-DEBUG] ${message}: ${error.message || error}`);
+};
+
+// warn 级别才会进客户端日志面板（info 会被过滤）
+const logWarn = (message, data = null) => {
+    const output = data !== undefined && data !== null ? `${message}: ${JSON.stringify(data)}` : message;
+    OmniBox.log("warn", `[iKanBot] ${output}`);
 };
 
 const encodeMeta = (obj) => {
@@ -552,6 +558,7 @@ async function home(params, context) {
             });
         }
         
+        if (list.length === 0) logWarn("首页未解析到任何条目，页面结构可能已变更");
         return {
             class: classes,
             list: list.slice(0, 20)
@@ -577,6 +584,7 @@ async function category(params, context) {
         const html = await getHtml(link);
         
         if (!html) {
+            logWarn(`分类 ${categoryId} 第 ${pg} 页请求返回空`);
             return { list: [], page: pg, pagecount: 1 };
         }
         
@@ -596,6 +604,7 @@ async function category(params, context) {
             });
         });
         
+        if (list.length === 0) logWarn(`分类 ${categoryId} 第 ${pg} 页解析到 0 条`);
         return {
             list: list,
             page: pg,
@@ -757,6 +766,7 @@ async function detail(params, context) {
                 playId: ep.playId,
             })),
         }));
+        if (normalizedPlaySources.length === 0) logWarn(`详情未解析到任何播放线路 videoId=${videoId}`);
         
         const fixedRemarks = '(线路利用网络爬虫技术获取,各线路的版本、清晰度、播放速度等存在差异请自行切换。建议避开晚上高峰时段。)';
 
@@ -852,6 +862,7 @@ async function search(params, context) {
         // 移除用于过滤的字段
         const finalList = filteredList.map(({ originalTitle, ...rest }) => rest);
         
+        if (finalList.length === 0) logWarn(`搜索「${wd}」过滤后 0 条（原始命中 ${allResults.length} 条）`);
         return {
             list: finalList,
             page: pg,
@@ -940,7 +951,7 @@ async function play(params) {
                 logInfo(`命中多线路清单，一次返回 ${multiLineResult.urls.length} 条`);
             }
         } catch (e) {
-            logInfo(`多线路清单读取失败，退回单条: ${e.message}`);
+            logWarn(`多线路清单读取失败，退回单条: ${e.message}`);
         }
     }
 
@@ -952,10 +963,10 @@ async function play(params) {
                 finalHeader = sniffResult.header || finalHeader;
                 logInfo("嗅探成功", { url: finalUrl });
             } else {
-                logInfo("嗅探未返回有效地址");
+                logWarn("嗅探未返回有效地址");
             }
         } catch (e) {
-            logInfo(`嗅探失败: ${e.message}`);
+            logWarn(`嗅探失败: ${e.message}`);
         }
     }
 
