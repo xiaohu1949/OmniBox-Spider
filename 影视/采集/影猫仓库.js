@@ -7,7 +7,7 @@
 // @description 多线路修复：vod_id 含下划线（search_ / up_）时不再错位，搜索入口也生效 (v1.3.3)
 // @description 死通道短路：03yy(530)/playr.top(000) 失效通道落盘拉黑 15 分钟，省去每次 4~5s 空等 (v1.3.5)
 // @dependencies: axios, crypto, cheerio, http, https
-// @version 1.3.5
+// @version 1.3.6
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/影猫仓库.js
 
 const axios = require("axios");
@@ -553,6 +553,34 @@ async function parseKaixinSource(url) {
 
 // ==================== 核心接口 ====================
 
+// 【v1.3.6】首页短 TTL 缓存。客户端每次切源都是新进程，且本源单次首页要打
+// ymck.pro/api.php/xiao/vod —— 实测该接口单次响应 5~6s，是最慢的一环。缓存后二次进入 <0.3s。
+const HOME_CACHE_KEY = "ymck:home:v1";
+const HOME_CACHE_TTL_SECONDS = 300; // 5 分钟
+
+async function readHomeCache() {
+  try {
+    const raw = await OmniBox.getCache(HOME_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    // 空结果绝不采用（防历史脏数据）
+    if (parsed && Array.isArray(parsed.list) && parsed.list.length > 0) return parsed;
+  } catch (e) {
+    logWarn(`首页缓存读取失败，按未命中处理: ${e.message || e}`);
+  }
+  return null;
+}
+
+async function writeHomeCache(value) {
+  // 空结果绝不入缓存（项目铁律）
+  if (!value || !Array.isArray(value.list) || value.list.length === 0) return;
+  try {
+    await OmniBox.setCache(HOME_CACHE_KEY, JSON.stringify(value), HOME_CACHE_TTL_SECONDS);
+  } catch (e) {
+    logWarn(`首页缓存写入失败: ${e.message || e}`);
+  }
+}
+
 async function home(params) {
   const classes = [
     { type_id: "1", type_name: "电影" },
@@ -571,6 +599,12 @@ async function home(params) {
   };
 
   try {
+    const cached = await readHomeCache();
+    if (cached) {
+      logInfo(`首页命中缓存 ${cached.list.length} 条`);
+      return cached;
+    }
+
     const url = `${HOST}/api.php/xiao/vod?page=1&limit=20`;
     const res = await axiosInstance.get(url, { 
         headers: { ...DEFAULT_HEADERS, "X-Requested-With": "XMLHttpRequest" } 
@@ -586,8 +620,11 @@ async function home(params) {
         }));
     }
     
-    return { class: classes, filters: filters, list: list, page: 1, pagecount: res.data.pagecount || 99, limit: 20, total: res.data.total || 999 };
+    const result = { class: classes, filters: filters, list: list, page: 1, pagecount: res.data.pagecount || 99, limit: 20, total: res.data.total || 999 };
+    await writeHomeCache(result);
+    return result;
   } catch (e) { 
+    logWarn(`首页获取失败: ${e.message || e}`);
     return { class: classes, filters: filters, list: [], page: 1, pagecount: 1 }; 
   }
 }

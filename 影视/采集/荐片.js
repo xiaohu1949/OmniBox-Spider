@@ -1,7 +1,7 @@
 // @name 荐片APP
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持
-// @version 1.0.8
+// @version 1.0.9
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/荐片.js
 /**
  * ============================================================================
@@ -1223,8 +1223,42 @@ const handlePlay = async (playId, vodId = "", context = {}) => {
  * @param {Object} params - 参数对象
  * @returns {Object} 返回分类列表和推荐视频列表
  */
+// 【v1.0.9】首页短 TTL 缓存。客户端每次切源都是新进程，而本源首页要串起
+// homeCategory(≈1.9s) + 6 个 filterOptions(并发) + hand_data(≈1.5s) 共 8 个请求，
+// 实测单次 4~6s。缓存后二次进入 <0.3s，与豆瓣/哔哩系对齐。
+const HOME_CACHE_KEY = 'jp:home:v1';
+const HOME_CACHE_TTL_SECONDS = 300; // 5 分钟
+
+async function readHomeCache() {
+  try {
+    const raw = await OmniBox.getCache(HOME_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    // 空结果绝不采用（防历史脏数据）
+    if (parsed && Array.isArray(parsed.list) && parsed.list.length > 0) return parsed;
+  } catch (e) {
+    logWarn(`首页缓存读取失败，按未命中处理: ${e.message || e}`);
+  }
+  return null;
+}
+
+async function writeHomeCache(value) {
+  // 空结果绝不入缓存（项目铁律）
+  if (!value || !Array.isArray(value.list) || value.list.length === 0) return;
+  try {
+    await OmniBox.setCache(HOME_CACHE_KEY, JSON.stringify(value), HOME_CACHE_TTL_SECONDS);
+  } catch (e) {
+    logWarn(`首页缓存写入失败: ${e.message || e}`);
+  }
+}
+
 async function home(params) {
   try {
+    const cached = await readHomeCache();
+    if (cached) {
+      logInfo('首页命中缓存', { count: cached.list.length });
+      return cached;
+    }
     logInfo('处理首页请求');
     // 【v1.0.8】先解析图片域名（失败自动降级到静态兜底，不影响首页出片）
     await ensureImgHost();
@@ -1236,11 +1270,13 @@ async function home(params) {
       recommendCount: recommendList.length
     });
 
-    return {
+    const result = {
       class: homeData.class,
       filters: homeData.filters,
       list: recommendList
     };
+    await writeHomeCache(result);
+    return result;
   } catch (error) {
     logError('获取首页数据失败', error);
     return {

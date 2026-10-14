@@ -3,7 +3,7 @@
 // @description 刮削：支持，弹幕：支持，嗅探：支持
 // @description 多线路：同一集在各条线路上的地址一次全列（当前线路优先）
 // @dependencies: axios, crypto-js
-// @version 1.0.5
+// @version 1.0.6
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/热播.js
 
 /**
@@ -665,8 +665,42 @@ function buildClassesAndFilters(typeList) {
  * @param {Object} params 参数对象
  * @returns {Promise<{class:Array,filters:Object,list:Array}>}
  */
+// 【v1.0.6】首页短 TTL 缓存：客户端每次切源都是新进程，首页要打 top_type + tj_vod 两个 POST。
+// 缓存后二次进入 <0.3s，与豆瓣/哔哩系对齐。
+const HOME_CACHE_KEY = "rbotv:home:v1";
+const HOME_CACHE_TTL_SECONDS = 300; // 5 分钟
+
+async function readHomeCache() {
+  try {
+    const raw = await OmniBox.getCache(HOME_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    // 空结果绝不采用（防历史脏数据）
+    if (parsed && Array.isArray(parsed.list) && parsed.list.length > 0) return parsed;
+  } catch (e) {
+    logWarn(`首页缓存读取失败，按未命中处理: ${e.message || e}`);
+  }
+  return null;
+}
+
+async function writeHomeCache(value) {
+  // 空结果绝不入缓存（项目铁律）
+  if (!value || !Array.isArray(value.list) || value.list.length === 0) return;
+  try {
+    await OmniBox.setCache(HOME_CACHE_KEY, JSON.stringify(value), HOME_CACHE_TTL_SECONDS);
+  } catch (e) {
+    logWarn(`首页缓存写入失败: ${e.message || e}`);
+  }
+}
+
 async function home(params) {
   try {
+    const cached = await readHomeCache();
+    if (cached) {
+      logInfo(`首页命中缓存 ${cached.list.length} 条`);
+      return cached;
+    }
+
     logInfo("获取首页数据");
 
     const [typeData, homeVodData] = await Promise.all([
@@ -678,7 +712,9 @@ async function home(params) {
     const allVideos = [...(homeVodData?.data?.cai || []), ...(homeVodData?.data?.loop || [])];
     const list = formatVideoList(allVideos.filter((i) => i.vod_id && String(i.vod_id) !== "0"));
 
-    return { class: classes, filters, list };
+    const result = { class: classes, filters, list };
+    await writeHomeCache(result);
+    return result;
   } catch (error) {
     logError("获取首页数据失败", error);
     return { class: [], filters: {}, list: [] };

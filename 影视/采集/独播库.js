@@ -2,7 +2,7 @@
 // @author @caipeibin
 // @description 刮削：支持，弹幕：支持，嗅探：支持
 // @dependencies: axios
-// @version 1.2.2
+// @version 1.2.3
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/独播库.js
 
 
@@ -38,6 +38,20 @@ const DANMU_API = process.env.DANMU_API || "";
 
 // 站点列表每页固定返回的条数（实测 /vodshow/1--------1--- 为 48 条）
 const PAGE_ITEMS = 48;
+
+// ---- 封面图代理前缀（可选，v1.2.3）----
+// 实测：本源的封面来自站点返回的 TnId 解码值，解出来就是 https://image.tmdb.org/t/p/w300/xxx.jpg
+// —— 即图源是 TMDB 官方 CDN，站点自己并没有另存一套图，所以「换成站点自有图」这条路不存在。
+// 而 image.tmdb.org / media.themoviedb.org / wsrv.nl 在容器网络下三次实测均 ECONNRESET（TCP 层被重置），
+// 大陆网络下封面必然加载失败，这是站点自身的图源选择，脚本层无法换源。
+// 若你自备了可用反代，设 DBK_IMG_PROXY=https://your-proxy（不带结尾 /）即可让封面走代理；
+// 默认留空 = 输出与之前逐字节一致（零回归）。
+const IMG_PROXY = String(process.env.DBK_IMG_PROXY || "").replace(/\/+$/, "");
+const TMDB_IMG_ORIGIN = "https://image.tmdb.org";
+function mapCover(url) {
+    if (!url || !IMG_PROXY) return url || "";
+    return url.startsWith(TMDB_IMG_ORIGIN) ? IMG_PROXY + url.slice(TMDB_IMG_ORIGIN.length) : url;
+}
 
 const axiosInstance = axios.create({
     timeout: 15 * 1000,
@@ -377,7 +391,7 @@ async function home(params) {
                     list.push({
                         vod_id: decodeDubokuData(vodId),
                         vod_name: vod.Name || '',
-                        vod_pic: decodeDubokuData(vodPic),
+                        vod_pic: mapCover(decodeDubokuData(vodPic)),
                         vod_remarks: vod.Tag || ''
                     });
                 });
@@ -419,7 +433,7 @@ async function category(params) {
                 list.push({
                     vod_id: decodeDubokuData(vodId),
                     vod_name: vod.Name || '',
-                    vod_pic: decodeDubokuData(vodPic),
+                    vod_pic: mapCover(decodeDubokuData(vodPic)),
                     vod_remarks: vod.Tag || ''
                 });
             });
@@ -456,7 +470,7 @@ async function search(params) {
                 list.push({
                     vod_id: decodeDubokuData(vodId),
                     vod_name: vod.Name || '',
-                    vod_pic: decodeDubokuData(vodPic),
+                    vod_pic: mapCover(decodeDubokuData(vodPic)),
                     vod_remarks: vod.Tag || '',
                     vod_actor: vod.Actor || '',
                     vod_score: vod.Rating || ''
@@ -543,7 +557,7 @@ async function detail(params) {
         const detail = {
             vod_id: vod_id,
             vod_name: data.Name || '',
-            vod_pic: vod_pic || '',
+            vod_pic: mapCover(vod_pic) || '',
             vod_remarks: data.Tag ? `评分：${data.Rating || '暂无'}` : '',
             vod_year: data.ReleaseYear || '',
             vod_area: data.Region || '',
@@ -619,7 +633,7 @@ async function detail(params) {
                     if (scrapeData) {
                         detail.vod_name = scrapeData.title || detail.vod_name;
                         if (scrapeData.posterPath) {
-                            detail.vod_pic = `https://image.tmdb.org/t/p/w500${scrapeData.posterPath}`;
+                            detail.vod_pic = mapCover(`https://image.tmdb.org/t/p/w500${scrapeData.posterPath}`);
                         }
                         if (scrapeData.overview) {
                             detail.vod_content = scrapeData.overview;

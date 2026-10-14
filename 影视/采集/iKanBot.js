@@ -2,7 +2,7 @@
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持
 // @dependencies: axios, cheerio, crypto
-// @version 1.0.6
+// @version 1.0.7
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/iKanBot.js
 
 
@@ -495,10 +495,43 @@ const parsePlaySourcesFromIkan = (playFrom, playList, vodName = '', videoId = ''
 /**
  * 首页
  */
+// 【v1.0.7】首页短 TTL 缓存：客户端每次切源都是新进程，本源首页要并抓 3 个页面
+// （热门电影/热门剧/首页），实测单次 2.3~2.7s。缓存后二次进入 <0.3s。
+const HOME_CACHE_KEY = "ikanbot:home:v1";
+const HOME_CACHE_TTL_SECONDS = 300; // 5 分钟
+
+async function readHomeCache() {
+    try {
+        const raw = await OmniBox.getCache(HOME_CACHE_KEY);
+        if (!raw) return null;
+        const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+        // 空结果绝不采用（防历史脏数据）
+        if (parsed && Array.isArray(parsed.list) && parsed.list.length > 0) return parsed;
+    } catch (e) {
+        logWarn(`首页缓存读取失败，按未命中处理: ${e.message || e}`);
+    }
+    return null;
+}
+
+async function writeHomeCache(value) {
+    // 空结果绝不入缓存（项目铁律）
+    if (!value || !Array.isArray(value.list) || value.list.length === 0) return;
+    try {
+        await OmniBox.setCache(HOME_CACHE_KEY, JSON.stringify(value), HOME_CACHE_TTL_SECONDS);
+    } catch (e) {
+        logWarn(`首页缓存写入失败: ${e.message || e}`);
+    }
+}
+
 async function home(params, context) {
     logInfo("进入首页");
     
     try {
+        const cached = await readHomeCache();
+        if (cached) {
+            logInfo(`首页命中缓存 ${cached.list.length} 条`);
+            return cached;
+        }
         const baseURL = params?.context?.baseURL || params?.baseURL || context?.baseURL || "";
         // 获取分类
         const classes = [];
@@ -559,10 +592,12 @@ async function home(params, context) {
         }
         
         if (list.length === 0) logWarn("首页未解析到任何条目，页面结构可能已变更");
-        return {
+        const result = {
             class: classes,
             list: list.slice(0, 20)
         };
+        await writeHomeCache(result);
+        return result;
     } catch (e) {
         logError("首页获取失败", e);
         return { class: [], list: [] };
