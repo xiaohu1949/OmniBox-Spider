@@ -2,7 +2,7 @@
 // @author https://github.com/hjdhnx/drpy-node/blob/main/spider/js/%E4%B8%83%E5%91%B3%5B%E4%BC%98%5D.js
 // @description 刮削：支持，弹幕：支持，嗅探：支持
 // @dependencies: axios, cheerio
-// @version 1.4.2
+// @version 1.4.3
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/七味.js
 
 // 注意：本源是「普通采集源」，刻意不声明 indexs / push 这两个特殊路由标记
@@ -1683,7 +1683,9 @@ async function home(params) {
             return cached;
         }
         const { html, host } = await requestHtmlWithFailover("/");
-        const list = parseVideoList(html, host);
+        // 首页裁到 60 条：站点首页返回 168 条，配小站图床(单张 400ms+)会一张张慢出，
+        // 60 条已覆盖首屏+滚动两屏，其余走分类页按需加载
+        const list = parseVideoList(html, host).slice(0, 60);
         logInfo("首页加载完成", { host, count: list.length });
         const result = {
             class: CLASSES,

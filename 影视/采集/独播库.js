@@ -2,7 +2,7 @@
 // @author @caipeibin
 // @description 刮削：支持，弹幕：支持，嗅探：支持
 // @dependencies: axios
-// @version 1.2.3
+// @version 1.2.4
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/独播库.js
 
 
@@ -399,8 +399,9 @@ async function home(params) {
         }
         logInfo(`获取到 ${list.length} 个首页推荐`);
         if (list.length === 0) logWarn("首页推荐返回 0 条，接口可能变更或签名失效");
-        // 首页由多个推荐板块拼成，原先只取 20 条会截掉大半内容
-        const result = { class: classes, filters, list: list.slice(0, 60) };
+        // 首页裁到 40 条：封面是 TMDB（大陆不可达，除非自备 DBK_IMG_PROXY 反代），
+        // 条数越多破图越多越显卡；40 条已够首屏铺满
+        const result = { class: classes, filters, list: list.slice(0, 40) };
         await writeCache("dbk:home:v1", result, HOME_CACHE_TTL);
         return result;
     } catch (error) {

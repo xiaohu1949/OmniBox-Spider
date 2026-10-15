@@ -1,7 +1,7 @@
 // @name 荐片APP
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持
-// @version 1.0.10
+// @version 1.0.11
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/荐片.js
 /**
  * ============================================================================
@@ -865,15 +865,19 @@ const getRecommendList = async () => {
 
     const formatted = formatList(list);
 
-    if (formatted.length > 0) {
+    // 首页裁到 60 条：hand_data 返回 327 条，327 张图床封面（小站自建、单张 200ms~2s）
+    // 是「加载慢」的主因；60 条覆盖首屏+滚动两屏，其余走分类按需加载
+    const trimmed = formatted.slice(0, 60);
+
+    if (trimmed.length > 0) {
       logInfo('推荐首条数据图片', {
-        name: formatted[0].vod_name,
-        pic: formatted[0].vod_pic.substring(0, 80) + '...'
+        name: trimmed[0].vod_name,
+        pic: trimmed[0].vod_pic.substring(0, 80) + '...'
       });
     }
 
-    logInfo('首页推荐获取成功', { count: formatted.length });
-    return formatted;
+    logInfo('首页推荐获取成功', { count: trimmed.length, raw: formatted.length });
+    return trimmed;
   } catch (e) {
     logError('获取首页推荐失败', e);
     return [];
