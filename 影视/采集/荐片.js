@@ -1,7 +1,7 @@
 // @name 荐片APP
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持
-// @version 1.0.9
+// @version 1.0.10
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/荐片.js
 /**
  * ============================================================================
@@ -27,6 +27,7 @@
  */
 
 const OmniBox = require("omnibox_sdk");
+const https = require("https");
 
 /**
  * 配置信息
@@ -359,24 +360,31 @@ async function request(url, options = {}) {
 
 /* ============================================================================
  * 【v1.0.8】图片域名：改为**动态下发**
+ * 【v1.0.10】图片域名：动态下发 + **并发探活选优**
  * ----------------------------------------------------------------------------
- * 站点已下线写死的 img.jgsfnl.com（2026-10-13 实测 HTTP 000，DNS 不通），
- * 改由接口下发一组可用域名：
- *   GET /api/v2/settings/resourceDomainConfig → { data: { imgDomain: "a.com,b.com,c.com" } }
- * 解析顺序：进程内 → SDK 落盘缓存(6h) → 接口 → 静态兜底。
- * 只取下发列表的首个域名（客户端本身不支持一个封面挂多域名）。
- * 任何一步失败都只降级不抛错，保证「域名接口挂了也还有图」。
+ * 站点已下线写死的 img.jgsfnl.com，改由接口下发一组可用域名：
+ *   GET /api/v2/settings/resourceDomainConfig → { data: { imgDomain: "a,b,c" } }
+ * 实测（2026-10-15，容器内）：下发 [img.ypfbj.com, img.cqkgy.com, img.bptpw.com]，
+ * 其中首个 img.ypfbj.com 最慢最不稳（样本图 3 次 2 次 12s 超时、偶发 ECONNRESET），
+ * img.bptpw.com 反而全部 200 且最快（~360ms）。**只取首个会固定选到最差的域名，
+ * 表现为「图片打不开 + 加载很慢」**。故改为：
+ *   1) 落盘健康域名（跨进程，优先用上次验证过的最快域名）——冷启动不乱选坏域名；
+ *   2) 接口取下发列表；
+ *   3) 对每个域名**并发探活**一张真实样图，选最快且成功者（只对网络层失败降级，
+ *      404 也算域名可达，避免路径问题误杀）；
+ *   4) 全失败 → 静态兜底（按实测稳定性排序，bptpw 排首）。
+ * 任何一步失败都只降级不抛错，保证「接口挂了也还有图」。
  * ========================================================================== */
-const IMG_HOST_CACHE_KEY = "jp:imgdomain:v1";
-const IMG_HOST_TTL_SECONDS = 6 * 3600;
+const IMG_HOST_OK_KEY = "jp:imgdomain:ok:v2";   // 探活验证过、最快可用的域名（落盘，跨进程）
+const IMG_HOST_OK_TTL = 6 * 3600;               // 图床整体抖动剧烈，6h 即可，故障能较快恢复重探
 const IMG_HOST_API = "/api/v2/settings/resourceDomainConfig";
-// 静态兜底：仅在接口不可用时使用（内容取 2026-10-13 接口实际下发值）
-const IMG_HOST_FALLBACK = ["img.ypfbj.com", "img.cqkgy.com", "img.bptpw.com"];
+// 静态兜底：按 2026-10-15 实测稳定性排序（bptpw 最稳、ypfbj 偶发 12s 超时排末）
+const IMG_HOST_FALLBACK = ["img.bptpw.com", "img.cqkgy.com", "img.ypfbj.com"];
 
 let imgHost = `https://${IMG_HOST_FALLBACK[0]}`;
 let imgHostPromise = null;
 
-/** 把各种形态的域名归一成 `https://host`；接口下发的是逗号分隔列表，只取首个 */
+/** 把各种形态的域名归一成 `https://host` */
 const normalizeImgHost = (raw) => {
   if (!raw || typeof raw !== 'string') return '';
   let s = String(raw).split(',')[0].trim();
@@ -385,46 +393,92 @@ const normalizeImgHost = (raw) => {
   return s.replace(/\/+$/, '');
 };
 
-/** 解析图片域名（幂等：同一进程只真正跑一次） */
+/** 取一张真实图片路径用于探活（轻量，仅冷启动健康缓存未命中时调用一次） */
+async function pickSamplePicPath() {
+  try {
+    const res = await request(`${jpConfig.host}/api/dyTag/hand_data?category_id=88`);
+    const arr = (res && (res.data && res.data.list)) || (res && res.list) || [];
+    for (const it of (Array.isArray(arr) ? arr : [])) {
+      const p = it && (it.path || it.tvimg || it.tagimg);
+      if (p) return p.startsWith('/') ? p : '/' + p;
+    }
+  } catch (_) { /* 忽略，退化到 favicon */ }
+  return null;
+}
+
+/**
+ * 探活单个域名：用 Node 原生 https 发请求，只看状态码、不下载 body（不依赖
+ * OmniBox.request，它对图片二进制响应无可靠超时会挂死）。只看网络层可达 +
+ * 2xx/3xx；404 也说明域名在（路径问题不算域名坏）。无样本路径时用根「/」
+ * （比 favicon 更能反映域名本身是否可达）。返回 { ok, ms, net? }
+ */
+function probeImgHost(domain, samplePath) {
+  return new Promise((resolve) => {
+    const url = `https://${domain}${samplePath || '/'}`;
+    const t = Date.now();
+    const req = https.get(
+      url,
+      { headers: jpConfig.headers, timeout: 6000, rejectUnauthorized: false },
+      (res) => {
+        const ok = res.statusCode >= 200 && res.statusCode < 400;
+        res.resume(); // 丢弃 body，避免缓冲挂起
+        resolve({ ok, ms: Date.now() - t });
+      }
+    );
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, ms: Date.now() - t, net: true }); });
+    req.on('error', () => { resolve({ ok: false, ms: Date.now() - t, net: true }); });
+  });
+}
+
+/** 解析图片域名（幂等：同一进程只真正跑一次；跨进程靠落盘健康缓存） */
 async function ensureImgHost() {
   if (imgHostPromise) return imgHostPromise;
   imgHostPromise = (async () => {
-    // 1) 落盘缓存（跨进程；客户端每次调用都是新进程，所以必须落盘）
+    // 1) 落盘健康域名（跨进程，优先用上次验证过的最快域名，绝不沿用上次切换到的坏域名）
     try {
-      const cached = await OmniBox.getCache(IMG_HOST_CACHE_KEY);
+      const cached = await OmniBox.getCache(IMG_HOST_OK_KEY);
       const h = normalizeImgHost(cached);
       if (h) {
         imgHost = h;
-        logInfo('图片域名命中缓存', { imgHost });
+        logInfo('图片域名命中健康缓存', { imgHost });
         return imgHost;
       }
-    } catch (e) {
-      logWarn(`读取图片域名缓存失败(可忽略): ${e.message || e}`);
-    }
+    } catch (_) { /* ignore */ }
 
-    // 2) 接口下发
+    // 2) 接口下发域名列表
+    let domains = [];
     try {
       const res = await request(`${jpConfig.host}${IMG_HOST_API}`);
-      const list = String(res?.data?.imgDomain || '')
-        .split(',').map((s) => s.trim()).filter(Boolean);
-      const h = normalizeImgHost(list[0]);
-      if (h) {
-        imgHost = h;
-        logInfo('图片域名取自接口', { imgHost, all: list });
-        try {
-          await OmniBox.setCache(IMG_HOST_CACHE_KEY, h, IMG_HOST_TTL_SECONDS);
-        } catch (e) {
-          logWarn(`写入图片域名缓存失败(可忽略): ${e.message || e}`);
-        }
-        return imgHost;
-      }
-      logWarn('图片域名接口未返回有效域名，改用静态兜底');
+      const raw = (res && res.data && res.data.imgDomain) || '';
+      domains = String(raw).split(',').map((s) => s.trim()).filter(Boolean);
     } catch (e) {
-      logWarn(`图片域名接口失败，改用静态兜底: ${e.message || e}`);
+      logWarn(`图片域名接口失败，改用兜底: ${e.message || e}`);
+    }
+    if (!domains.length) domains = IMG_HOST_FALLBACK.slice();
+
+    // 3) 并发探活选优（取最快成功者；只对网络层失败降级，404 也算可达）
+    const samplePath = await pickSamplePicPath();
+    const probes = await Promise.all(
+      domains.map(async (d) => ({ d, r: await probeImgHost(d, samplePath) }))
+    );
+    probes.sort((a, b) => (a.r.ok ? a.r.ms : 1e9) - (b.r.ok ? b.r.ms : 1e9));
+    const best = probes.find((p) => p.r.ok);
+    if (best) {
+      imgHost = `https://${best.d}`;
+      logInfo('图片域名探活选优', {
+        imgHost,
+        ms: best.r.ms,
+        all: probes.map((p) => `${p.d}:${p.r.ok ? p.r.ms + 'ms' : 'FAIL'}`).join(','),
+      });
+      try { await OmniBox.setCache(IMG_HOST_OK_KEY, imgHost, IMG_HOST_OK_TTL); } catch (_) {}
+      return imgHost;
     }
 
-    // 3) 静态兜底
+    // 4) 全失败 → 静态兜底（按稳定性排序）。兜底也写入健康缓存，但 TTL 较短，
+    //    让图床整体抖动恢复后能较快重新探活（避免 24h 内一直用可能挂的域名）。
+    logWarn('所有图片域名探活失败，用静态兜底');
     imgHost = `https://${IMG_HOST_FALLBACK[0]}`;
+    try { await OmniBox.setCache(IMG_HOST_OK_KEY, imgHost, 3600); } catch (_) {}
     return imgHost;
   })();
   return imgHostPromise;
