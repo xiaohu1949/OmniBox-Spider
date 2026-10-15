@@ -1,7 +1,7 @@
 // @name 荐片APP
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持
-// @version 1.0.11
+// @version 1.0.12
 // @downloadURL https://gh-proxy.org/https://github.com/xiaohu1949/OmniBox-Spider/raw/refs/heads/main/影视/采集/荐片.js
 /**
  * ============================================================================
@@ -28,6 +28,13 @@
 
 const OmniBox = require("omnibox_sdk");
 const https = require("https");
+
+/**
+ * 【v1.0.12】图片总开关：默认关闭（用户要求：不要图片，保证流畅）
+ * 荐片三个图床域名整体 DNS 剧烈抖动（dnsjp.cc 服务大面积 SERVFAIL，实测 80% 失败），
+ * 封面时好时坏且拖慢列表；设环境变量 JP_IMAGES=1 可恢复封面。
+ */
+const JP_NO_IMAGES = process.env.JP_IMAGES !== "1";
 
 /**
  * 配置信息
@@ -521,7 +528,7 @@ const formatList = (data) => {
     return {
       vod_id: String(i.id),
       vod_name: i.title || '未知标题',
-      vod_pic: getPicUrl(picPath),
+      vod_pic: JP_NO_IMAGES ? '' : getPicUrl(picPath),
       vod_remarks: i.mask || (i.score ? `评分:${i.score}` : '')
     };
   });
@@ -573,7 +580,7 @@ const getNetflixList = async (subType, page = 1) => {
     const list = data.map(item => ({
       vod_id: (item.id || item._id?.$oid)?.toString() + '@netflix',
       vod_name: item.title,
-      vod_pic: getPicUrl(item.tvimg || item.path),
+      vod_pic: JP_NO_IMAGES ? '' : getPicUrl(item.tvimg || item.path),
       vod_remarks: (item.mask || '') + (item.score ? ` ⭐${item.score}` : '')
     }));
 
@@ -1148,7 +1155,7 @@ const getDetail = async (ids) => {
       list: [{
         vod_id: ids,
         vod_name: scrapeData?.title || v.title || '未知标题',
-        vod_pic: scrapeData?.posterPath ? `https://image.tmdb.org/t/p/w500${scrapeData.posterPath}` : fullPicUrl,
+        vod_pic: JP_NO_IMAGES ? '' : (scrapeData?.posterPath ? `https://image.tmdb.org/t/p/w500${scrapeData.posterPath}` : fullPicUrl),
         vod_content: scrapeData?.overview || v.description || '',
         vod_play_sources: vodPlaySources.length > 0 ? vodPlaySources : undefined,
         vod_remarks: v.mask || (v.score ? `评分:${v.score}` : ''),
@@ -1319,7 +1326,7 @@ async function home(params) {
     }
     logInfo('处理首页请求');
     // 【v1.0.8】先解析图片域名（失败自动降级到静态兜底，不影响首页出片）
-    await ensureImgHost();
+    if (!JP_NO_IMAGES) await ensureImgHost(); // 图片关闭时跳过探活（抖动 DNS 下探活要 5~13s）
     const homeData = await getHomeContent();
     const recommendList = await getRecommendList();
 
@@ -1361,7 +1368,7 @@ async function category(params) {
     logInfo(`获取分类数据: categoryId=${categoryId}, page=${page}`);
 
     // 【v1.0.8】解析图片域名（Netflix 分支与普通分类都要用封面）
-    await ensureImgHost();
+    if (!JP_NO_IMAGES) await ensureImgHost(); // 图片关闭时跳过探活（抖动 DNS 下探活要 5~13s）
 
     // 处理 Netflix 分类
     if (categoryId === 'netflix') {
@@ -1423,7 +1430,7 @@ async function detail(params) {
     logInfo(`获取视频详情: videoId=${videoId}`);
 
     // 【v1.0.8】解析图片域名（详情封面）
-    await ensureImgHost();
+    if (!JP_NO_IMAGES) await ensureImgHost(); // 图片关闭时跳过探活（抖动 DNS 下探活要 5~13s）
 
     return await getDetail(videoId);
   } catch (error) {
@@ -1458,7 +1465,7 @@ async function search(params) {
     logInfo(`搜索视频: keyword=${keyword}, page=${page}`);
 
     // 【v1.0.8】解析图片域名（搜索结果封面）
-    await ensureImgHost();
+    if (!JP_NO_IMAGES) await ensureImgHost(); // 图片关闭时跳过探活（抖动 DNS 下探活要 5~13s）
 
     return await searchVod(keyword, page);
   } catch (error) {
